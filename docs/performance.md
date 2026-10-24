@@ -1,0 +1,2516 @@
+# Serving performance
+
+## V100 Duo measurement and acceptance
+
+The active port uses two Tesla V100-SXM2 16 GB cards, CUDA 12.8 (`sm_70`), and the local
+`qwen3.8-27b/gguf-q4-k-m` artifact converted from LM Studio's Qwen3.8-27B Q4_K_M GGUF.
+On the fixed code-generation workload below, three valid runs at exactly 85,000 occupied prompt
+tokens measured **53.4075 ± 0.0639 committed decode tok/s** (mean ± sample standard deviation),
+**18.68% above** the user's approximately 45 tok/s baseline. Each run measures 512 decode tokens
+with 180,000-token capacity. This establishes the speed result for this prompt and output window;
+it does not guarantee the same speed on every prompt. The RTX 5090 tables later in this document
+are inherited results for different hardware and weight profiles.
+
+Startup disables direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains, verifies the selected
+transfer route with exact byte comparisons in both directions, and rejects startup if verification
+fails. The host of this historical Q4_K_M measurement used `DMA-FQ` and therefore CUDA's
+host-staged copies; the current host has no IOMMU translation and runs direct NVLink P2P (see
+[GSQ-RCO IQ3_S](#v100-duo-gsq-rco-iq3_s-gguf-blocks)). This route passes the collective
+suite, including different tensor sizes, guards and 64 consecutive rounds, and the three public
+Engine CUDA Graph measurements below. The INT8 attention test also passes its independent FP64
+oracle at 85K occupied keys for all four queries, all 24 heads and every visible key, with TP1/TP2 comparisons
+and exact cache checks. Real-model MTP/non-MTP teacher forcing and graph/eager regression gates
+pass on their short-prompt fixtures. The source Q4_K/Q6_K codes and scales remain unchanged;
+these numerical and state checks support the tested route without asserting universal quality
+parity for all prompts.
+
+| Setting | V100 Duo comparison profile |
+|---|---|
+| GPUs | 2 x Tesla V100-SXM2 16 GB, TP2, devices 0 and 1 |
+| CUDA compile/runtime | 12.8 / 12.8 |
+| Artifact | `qwen3.8-27b/gguf-q4-k-m`; original Q4_K/Q6_K blocks and scales |
+| Request mode | One active request |
+| Context capacity | 180,000 tokens, native RoPE |
+| Primary occupied context | Exactly 85,000 actual prompt tokens |
+| KV cache | INT8 group-64; compared with LM Studio's Q8 KV configuration |
+| CUDA Graph | Enabled |
+| Prefill chunk | 1,024 tokens |
+| NInfer MTP | Fixed draft window of three; optimized proposal head (`--lm-head-draft`) |
+| Measured output window | 512 decode tokens plus the first token from prefill; three repetitions |
+| TP2 transport | Verified CUDA host-staged copies on the IOMMU host used for this measurement |
+
+NInfer's `--mtp-draft-tokens 3` uses a fixed three-token proposal window, shortened when the remaining
+output or context budget requires it. Verification may accept zero drafts. This is distinct from
+LM Studio's maximum-three/minimum-zero draft configuration: a minimum draft count of zero permits
+its proposal policy to vary how many drafts it attempts, whereas zero accepted drafts describes
+the verification result. The two engines therefore use related, but different, MTP schedules.
+
+| Repetition | Committed decode wall tok/s |
+|---|---:|
+| 1 | 53.3498 |
+| 2 | 53.3966 |
+| 3 | 53.4761 |
+| Mean ± sample standard deviation | **53.4075 ± 0.0639** |
+
+Every repetition produced the same 513 token IDs, with no EOS/EOG token in the captured window,
+and accepted **364 / 444 drafts (81.98%)**. Prefill took **298.132–298.154 s** per repetition and
+is excluded from decode throughput. Host CPU use was approximately one of 32 logical cores;
+observed GPU memory use was **13,768 / 13,454 MiB**, including about 313 MiB of desktop use on GPU 0.
+
+A separate short-input code-chat measurement used 512 prompt tokens, the same 180,000-token
+capacity and execution settings, one warmup, and three 256-token decode windows. Its wall decode
+rates were **59.9644, 60.0509 and 60.0721 tok/s**, or **60.0291 ± 0.0571 tok/s** (mean ± sample
+standard deviation), with **65.89%** draft acceptance. All three 257-token outputs were identical
+and EOS/EOG-free. This exceeds the reported 57 tok/s peak numerically, but the unspecified
+occupancy of that peak prevents a matched comparison; it is not the 85K acceptance result.
+
+The user-reported LM Studio baseline is approximately **45 committed decode tok/s at 85K occupied
+context**, with a reported **57 tok/s peak** whose context occupancy was not specified. The
+approximately 40 tok/s figure at longer context is an estimate. These observations are the
+acceptance reference; the 18.68% gain is relative to the reported 45 tok/s value, rather than the
+matched-engine measurement below. The 57 tok/s peak has not been exceeded by this 85K result and lacks
+the context occupancy needed for a like-for-like comparison.
+
+A matched diagnostic run of LM Studio's CUDA backend **2.33.0** used its automatic two-GPU split,
+the same source GGUF and exact 85,000 prompt IDs, Q8 KV, a requested 180,000-token capacity
+(rounded by the backend to 180,224), and maximum-three/minimum-zero MTP. Both engines used greedy
+sampling and generated 513 output tokens: one from prefill and 512 in the measured decode interval.
+
+| Engine | Decode tok/s | Prefill seconds | Accepted / drafted |
+|---|---:|---:|---:|
+| NInfer V100 Duo, mean of three runs | **53.4075** | 298.144 | 364 / 444 per run (81.98%) |
+| LM Studio CUDA 2.33.0, one run | **35.4977** | 185.374 | 365 / 440 (82.95%) |
+
+The LM run decoded for **14.42347 s**, evaluated all 85,000 prompt tokens without cache reuse,
+and stopped at the output limit without any EOS/EOG token. NInfer's decode rate is **50.45% higher**
+in this comparison, with similar MTP acceptance. Its prefill is **1.61 times as long**, so this is
+a decode improvement, not a reduction in cold-request completion latency. The single LM run is
+a diagnostic, not a stable average, and does not replace the user's approximately 45 tok/s
+acceptance baseline.
+
+Measure committed output tokens per decode second, excluding the first token produced by prefill.
+Rejected draft tokens do not count as output. Report repeated measurements and context occupancy;
+a short-prompt result at `--max-context 180000` cannot establish performance at 85K occupied tokens.
+Use the same prompt content and sampling for the final LM Studio comparison. Record GPU memory,
+power and aggregate CPU use; keep CPU below the user's approximately 85% ceiling.
+
+The public Engine benchmark provides a reproducible greedy diagnostic. The code-chat corpus below
+uses the artifact's embedded tokenizer and chat template with thinking disabled, distinct repository
+source excerpts, and a final bounded blocking task-queue implementation request. The tool trims the
+source excerpt body to make the complete prompt exactly 85,000 tokens, preserving the task and
+assistant prefix; it does not repeat excerpts to fill the context. Feed the saved token IDs directly
+to both engines, without applying another template or decoding and retokenizing them. Keep the
+corpus command's `--output-tokens 1024`: this is part of the fixed prompt's wording, independent of
+the measured 512-token decode window. The bundled 65,536-token benchmark corpus is too short for
+this case:
+
+```bash
+cmake -S . -B build-v100-duo -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build-v100-duo --target ninfer_bench ninfer_v100_corpus -j
+
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+build-v100-duo/bench/ninfer_v100_corpus \
+  /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+  /tmp/v100-code-85000.ids --code-chat 85000 --output-tokens 1024 \
+  src/core/host_worker_pool.h \
+  src/core/host_worker_pool.cpp \
+  src/runtime/engine/concurrent_executor.h \
+  src/targets/qwen3_6/impl/runtime/program_impl.h \
+  src/targets/qwen3_6/impl/runtime/text_context_impl.h \
+  src/targets/qwen3_6/impl/runtime/layouts_impl.h \
+  src/targets/qwen3_6/impl/runtime/mtp_impl.h \
+  src/ops/kernel/gqa_attention_decode_i8.cuh \
+  src/ops/kernel/gqa_attention_decode_i8_tc_volta.cuh
+
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+build-v100-duo/bench/ninfer_bench \
+  --weights /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+  --tp 2 --devices 0,1 --max-ctx 180000 --kv-dtype int8 \
+  --prefill-chunk 1024 --mtp-draft-tokens 3 --lm-head-draft \
+  --corpus /tmp/v100-code-85000.ids \
+  -pg 85000,512 --warmup 0 -r 3 --capture-generation -o json \
+  --output-file /tmp/ninfer-v100-duo-85000.json
+```
+
+`-pg 85000,512` fixes the output window at 513 tokens: one from prefill and 512 from decode.
+Each measured decode follows the full 85K-token prefill, and the Engine primes its CUDA Graphs
+before use; `--warmup 0` omits an additional benchmark warmup generation. For a cross-engine
+wall-time decode comparison, compute each repetition's rate as
+`512 / (timings.total_seconds - timings.first_token_seconds)`. Both timestamps include the same
+prompt preparation and submission origin, so subtraction leaves the interval from first-token
+commit to request completion, including work between decode rounds. The separately reported
+`decode_output_tok_s` uses accumulated Program decode-phase time and excludes some Engine work
+between rounds.
+
+`--capture-generation` retains each measured repetition's raw text and token IDs under
+`reps[].generation`. NInfer's fixed-budget benchmark disables model-default stopping but can emit
+EOS tokens. An accepted repetition must contain no EOS within its entire 513-token output window;
+also inspect the captured text for repetition before counting its rate as useful answer throughput.
+The matched 512-token LM comparison uses `compare_llama.py` with `ignore_eos=false`, without
+EOG-token logit biases. It requires `tokens_predicted=513` and a non-EOS ending; otherwise it saves
+the returned output and rejects the repetition instead of calculating a complete-window rate.
+
+The comparison used this local LM Studio backend command, leaving GPU splitting automatic:
+
+```bash
+LD_LIBRARY_PATH=/home/z/.lmstudio/extensions/backends/vendor/linux-llama-cuda-vendor-v1 \
+/home/z/.lmstudio/extensions/backends/llama.cpp-linux-x86_64-nvidia-cuda-avx2-2.33.0/llama-server \
+  --model /Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf \
+  --ctx-size 180000 --parallel 1 \
+  --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 0 \
+  --threads 16 --threads-batch 24 \
+  --host 127.0.0.1 --port 18081 --no-webui
+```
+
+With that backend ready, run the matched single-round diagnostic using Python 3.11:
+
+```bash
+.venv/bin/python3 tools/v100/compare_llama.py \
+  --url http://127.0.0.1:18081 \
+  --corpus /tmp/v100-code-85000.ids \
+  --prompt-tokens 85000 --decode-tokens 512 --repetitions 1 \
+  --output /tmp/llama-v100-duo-85000.json
+```
+
+This one-round LM Studio diagnostic does not establish a stable average. The NInfer comparison
+against the user's 45 tok/s baseline uses the three measured repetitions above.
+
+These are fixed-window code-generation throughput measurements, not evaluations of whether the
+generated code correctly solves the requested programming task.
+
+Quality checks are separate from timing. Preserving the source quantization blocks is an exact
+conversion claim; control-tensor transformations and floating-point operators require numerical
+oracles. Real-model MTP/non-MTP teacher forcing, graph/eager comparisons and cross-device state
+checks qualify the execution path. A plausible answer or a faster kernel alone is insufficient to
+claim unchanged model quality or an end-to-end speedup.
+
+## V100 Duo prefill investigation
+
+The three application labels below are *length proxies*, not runs of Pi agent, Codex, or Claude
+Code. All requests consume the same fixed `bench/fixtures/bench_corpus.ids` through the public
+Engine's raw-token route; each measured request has cold prefix state, one generated token, and no
+MTP decode. This controls the workload when comparing prefill chunk widths, but does not measure
+agent tool calls, prompt quality, or model inference in 1Cat-vLLM. Token IDs are fixed; prefill
+phase duration is measured inside Engine, excluding load, preparation, and decode.
+
+On September 28, 2026, the local dual Tesla V100-SXM2 16 GB host (CUDA 12.8), official
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer` v3 artifact (23,719,715,844 bytes), TP2,
+INT8 group-64 KV, and 32,768-token capacity produced the following. Each cell is the mean of
+two measured requests after one discarded warmup, using `ninfer_bench` and the same corpus:
+
+| Length proxy | Prompt | Chunk 1,024 (seconds; tok/s) | Chunk 2,048 | Chunk 4,096 |
+|---|---:|---:|---:|---:|
+| Pi agent | 1,024 | 0.982; 1,042.3 | 0.984; 1,041.1 | 0.983; 1,041.3 |
+| Codex | 10,240 | 10.051; 1,018.8 | 9.295; 1,101.7 | 9.040; 1,132.7 |
+| Claude Code | 20,480 | 20.639; 992.3 | 19.155; 1,069.2 | 18.549; 1,104.1 |
+
+This is a **chunk configuration** result, not a new operator speedup or a comparison of the two
+engines. The 4,096-token chunk gains 11.2% at 10K and 11.3% at 20K relative to 1,024; at 1K,
+all chunks are within 0.2%. Per-rank reserved workspace rises from 505,670,144 bytes (1,024)
+to 654,576,128 (2,048) and 952,388,096 (4,096), while the observed arena peak at 20K rises
+from 273,686,528 to 369,115,136 and 559,972,352 bytes. Larger chunks cost memory *before* a
+request starts, even when it is only 1K long.
+
+The 200,000-token production context plus MTP3 rejects a 2,048 chunk at Engine reservation:
+5,388,112,128 bytes requested against 5,370,736,128 available. At 196,608 capacity, MTP3 and
+2,048 do fit, with 65,018,112 bytes of planned slack; a one-request cold 20,480-token check
+returned 19.242 s (1,064.4 tok/s), versus 20.750 s (987.0 tok/s) with 1,024 at the same
+capacity. This single-request production-profile check supports feasibility, **not** a stable
+long-context performance average. Both requests returned the same first token (ID 864); this
+is not a general numerical or quality qualification. The **previous** 200K capacity can only
+be restored by passing `--max-context 200000 --prefill-chunk 1024` together. A proposed 2,048
+chunk at that capacity is discarded because the memory contract does not permit it. A larger
+chunk is also discarded
+as an *exactly 1,024-token* optimization because it provides no measurable benefit at that
+boundary; a real 1,298-token Pi request instead benefits by avoiding a second chunk.
+
+Reproduce the 32K matrix after enabling `-DNINFER_BUILD_BENCHMARKS=ON` in the Volta CMake
+configuration and building `ninfer_bench` with `cmake --build build-v100-duo -j --target
+ninfer_bench`. Select the official artifact explicitly and keep the corpus and capacity fixed:
+
+```bash
+export LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+for chunk in 1024 2048 4096; do
+  build-v100-duo/bench/ninfer_bench \
+    --weights /path/to/qwen3_8_27b_nvfp4.ninfer \
+    --corpus bench/fixtures/bench_corpus.ids \
+    --tp 2 --devices 0,1 --kv-dtype int8 --max-ctx 32768 \
+    --prefill-chunk "$chunk" -p 1024,10240,20480 -r 2 --warmup 1
+done
+```
+
+**What transfers from 1Cat-vLLM.** Its SM70 NVFP4 path (`csrc/sm70_turbomind/ops/
+nvfp4_qpn4_sm70.cu`) keeps the small-M QPN route and, for admitted large M, materializes a
+transient FP16 weight matrix before a tensor-core GEMM; the dense weight is *not* kept resident
+across layers. NInfer already selects A16 on Volta (`src/ops/linear/nvfp4/nvfp4_config.h`) and
+uses CUTLASS FP16 materialization for large-T SwiGLU, GDN input, and residual projections
+(`src/ops/linear/nvfp4/nvfp4_cutlass_sm70.cu` and the affected Op plans). It does not run the
+Blackwell W4A4 arithmetic on V100. The shared QPN layout is already decoded by this CUTLASS
+route. Simply introducing a second materialization is not a new optimization; switching GEMM
+libraries or fusing the existing epilogues would need matched Op and end-to-end tests, including
+BF16-versus-FP16 casting boundaries. No arithmetic kernel is changed by this chunk sweep.
+
+### Chunk peak and captured agent requests
+
+Further 32K cold-prefix sweeps used the same two-V100 host, artifact, fixed-corpus prompt
+sizes and two measured repetitions. The following are **whole-Engine** rates; reserved
+workspace is per rank and includes the effect of the chunk selection:
+
+| Prefill chunk | 10,240 prompt tok/s | 20,480 prompt tok/s | Reserved workspace (MiB) |
+|---:|---:|---:|---:|
+| 1,024 | 1,018.8 | 992.3 | 482 |
+| 2,048 | 1,101.7 | 1,069.2 | 624 |
+| 3,072 | 1,114.7 | 1,089.6 | 766 |
+| 4,096 | 1,132.7 | 1,104.1 | 908 |
+| 4,608 | 1,128.0 | 1,099.3 | 979 |
+| 4,864 | 1,121.5 | 1,094.5 | 1,015 |
+| 5,120 | **1,146.8** | **1,107.6** | 1,050 |
+| 5,376 | 1,137.9 | 1,099.9 | 1,086 |
+| 6,144 | 1,103.2 | 1,052.0 | 1,192 |
+| 7,168 | 1,029.9 | 989.4 | 1,334 |
+| 8,192 | 986.7 | 966.5 | 1,476 |
+| 16,384 | 950.5 | 948.6 | 2,921 |
+
+The 5,120 synthetic peak is only 1.25% faster at 10K and 0.31% at 20K than 4,096,
+despite reserving another 142 MiB per GPU. 8,192 and 16,384 are **discarded**, not kept as
+larger-is-better routes. As a separate check, the three SDKs were invoked with the same small
+repository question in an empty workspace, pointing model requests at a loopback rejecting
+server. The raw JSON first-turn payloads and derived text are local to
+`/tmp/ninfer-agent-prefill/` (not committed). The rendered system instructions, tool schemas
+and user messages were encoded using this **artifact's tokenizer** via `ninfer_v100_corpus`,
+then measured through cold NInfer Engine requests with the same TP2/INT8/32K/one-output-token
+contract as the fixed-length sweep:
+
+| First-turn SDK payload | NInfer tokens | Chunk 1,024 | Chunk 4,096 | Chunk 5,120 |
+|---|---:|---:|---:|---:|
+| Pi SDK 0.73.1 | 1,298 | 938.1 | **1,056.0** | 1,056.7 |
+| Codex SDK 0.158.0 | 11,718 | 1,004.0 | **1,132.9** | 1,129.0 |
+| Claude Agent SDK 0.3.283 | 16,368 | 999.7 | **1,116.7** | 1,113.7 |
+
+Every cell is prompt tok/s from two measured repetitions after one warmup. All three chunk
+settings emitted the same first token **within** each payload; this is not a cross-engine
+quality check. The 4,096 choice improves Pi by 12.6%, Codex by 12.8%, and Claude by 11.7%
+versus 1,024. For these realistic agent first-turn *payloads* 5,120 ties Pi and loses
+slightly on both longer requests. Choose 4,096 on robustness, reserved memory and prompt
+coverage; do not make the small synthetic 5,120 peak the product default.
+
+The fast-prefill *production* selection is `--max-context 180224 --prefill-chunk 4096` with
+MTP3, the optimized proposal head, and CUDA Graph decode. It gives up 19,776 context tokens
+(9.9%) versus the former 200K default. At 180,224 capacity, the captured Claude prompt ran
+at 993.97, 1,109.23, and 1,107.50 prefill tok/s for chunks 1,024, 4,096, and 5,120
+respectively (one warmup, two measured repetitions each). Planned per-rank slack was 670.2,
+343.0, and 233.9 MB respectively. The exact requested first token matched across these three
+widths. At the selected 180,224/4,096 configuration, **all three** captured prompts also
+completed an eight-token MTP3 decode interval through the CUDA Graph route; matching 1,024
+controls returned the same nine output IDs for each prompt. This establishes a useful
+functional check, not a parity guarantee for all prompts or chunk boundaries.
+
+For the concise README prefill table, each captured first-turn request was also run
+once through the public Engine under the **selected production configuration**
+(180,224 capacity, 4,096 chunk, TP2, INT8 KV, optimized MTP3 and CUDA Graph):
+
+| Captured request | Qwen tokens | First token seconds (TTFT) | Prefill seconds | Prefill tok/s |
+|---|---:|---:|---:|---:|
+| Pi | 1,298 | 1.246371524 | 1.2463 | 1,041.46 |
+| Codex | 11,718 | 10.398303200 | 10.3979 | 1,126.95 |
+| Claude Agent | 16,368 | 14.711902570 | 14.7112 | 1,112.62 |
+
+These are single cold requests with eight decode tokens after the measured prefill,
+**zero warmups and one measured repetition each**. TTFT is the public Engine's
+`reps[0].timings.first_token_seconds` in each captured Agent's
+`*-ctx180224-c4096-mtp8.json` report: request start to first generated token,
+including Engine preparation and prefill, but excluding model load, SDK startup,
+network transport, HTTP streaming, and Agent tool execution. It is not a
+measured first *visible character* in a running Agent UI. They are not the 32K-capacity,
+two-repetition chunk-sweep figures above or a claim about interactive Agent latency.
+
+With a real 16,368-token captured Claude prompt and eight-token MTP3 decode window at the
+same 180,224 capacity, 4,096 versus 1,024 measured prefill 1,112.62 versus 994.44 tok/s
+on single measured requests; both graph-prime requests and the nine generated IDs matched.
+The 4,096 profile reserves 243,785,984 bytes planned slack per card before graph capture,
+similar to the formerly published 196,608/1,024 headroom. At 184,320/4,096 a single
+prefill+MTP3 graph request still passed (1,109.97 prefill tok/s, identical nine generated IDs)
+but planned slack was only 144,563,968 bytes. We select 180,224 for additional margin, not
+the tightest feasible capacity. The former 200K/1,024 capacity remains an explicit override;
+do not combine that capacity with the new 4,096 default chunk.
+
+**1Cat-vLLM's “8K” boundary** refers to the specialized SM70 Q8000/Q8192 attention
+kernel's *per-request query chunk*: other shapes fall back to the general route. Its
+`max_num_batched_tokens` may be 16,384 while scheduling two Q8192 chunks; 8,192 is **not**
+a universal vLLM scheduler limit. NInfer's measured 8,192-token chunk is slower than 4,096
+for the 10K/20K prompts and has an independent workload/precision policy.
+
+The SDKs were stopped by the local endpoint before inference or tool calls. This captures
+their original **client-side API request**, not hidden provider-added instructions, a whole
+interactive transcript, or the provider's tokenization. Qwen token IDs are generated from
+a JSON rendering of the system, messages and tools, not an exact provider chat-template
+encoding. No Pi/Codex/Claude quality or cross-model speed claim follows. The reproduction
+harness and its local-only/privacy contract are in
+[`tools/v100/agent_prefill/README.md`](../tools/v100/agent_prefill/README.md).
+
+The 1Cat-vLLM SM70 long-prefill attention (`csrc/attention/sm70_v37/` and
+`csrc/attention/sm70_79t/`) separates prefix GEMM from a causal tail, packs six Q heads per
+KV head, and uses FP32 online merge; the Q8000/Q8192 specialization needs a 768 MiB score
+workspace per GPU and has narrow FP16/KV-alignment admission. NInfer's paged INT8 KV and BF16
+query/output use a different precision and memory contract; moreover TP2 has 12 Q heads and
+2 KV heads per rank, whereas that kernel admits 6 Q heads and 1 KV head per rank. Its
+large-attention approach may be
+worth a *separate* kernel profile and independent oracle qualification at longer occupied
+contexts, but direct transplantation is not justified by the 1K/10K/20K whole-model data or
+the 16 GB production headroom. Published 1Cat-vLLM long-prefill results often use TP4 on four
+V100 32 GB cards, sometimes with FP8 weights/draft models; none is a like-for-like two-card
+NVFP4 baseline. We therefore do not quote those throughput figures as an NInfer speed ratio.
+
+### V100 Duo decode: pelican HTML
+
+On September 28, 2026, the local **2 × Tesla V100-SXM2 16 GB** host, CUDA 12.8,
+official Qwen3.8-27B NVFP4 artifact (`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer`),
+and the production launcher (`tools/v100/ninfer-v100-duo.sh`) ran TP2, INT8 KV,
+MTP3/4/5 with optimized draft head, CUDA Graph, 180,224-token context capacity,
+4,096-token prefill chunks, and one active request. Each window had its own
+resident server; thinking and prefix reuse were disabled. The **exact English
+user prompt** was:
+
+> Create a complete, self-contained HTML file containing inline SVG that depicts a pelican riding a bicycle. Animate it in 2D: the wheels spin and the pelican pedals. Use no external resources. The file should work by saving it as an .html file and opening it directly in a browser.
+
+The public OpenAI Chat Completions endpoint received one user message,
+`reasoning_effort: "none"`, `temperature: 0` (greedy), `seed: 42`, and
+`max_tokens: 12288`. The Qwen chat template counted **74 prompt tokens**.
+Each window ran three complete requests on its own resident server, with zero
+prefix-cache hits and no reasoning content. All nine
+stopped naturally. The speeds below use committed decode tokens divided by
+`request_done.timings_seconds.decode`, namely
+`(completion_tokens - 1) / decode_seconds` because prefill emits the first token.
+**Peak (5 s)** is the highest single 5-second `throughput` interval's committed
+decode rate across the three requests, as logged by the server (one active
+request); **average** is the arithmetic mean of three full-request rates. These
+are *different time windows*, so peak and average should not be treated as
+statistics over identical intervals. The highest full-request rate is also
+listed to disambiguate peak definitions.
+
+| Draft window | Output tokens per run | Decode seconds (3 runs) | Peak 5 s tok/s | Peak full-request tok/s | Average full-request tok/s | Drafts accepted |
+|---|---:|---|---:|---:|---:|---:|
+| MTP3 (default) | 9,668 | 78.9587 / 78.9618 / 78.9562 | 132.0 | 122.435 | 122.431 | 7,003 / 7,998 (87.56%) |
+| MTP4 | 9,324 | 72.5892 / 72.5987 / 72.6085 | 142.4 | 128.435 | 128.418 | 7,140 / 8,748 (81.62%) |
+| MTP5 | 9,881 | 72.7104 / 72.7043 / 72.7035 | **159.2** | **135.894** | **135.890** | 7,859 / 10,110 (77.73%) |
+
+The MTP5 average is **10.99% above MTP3** on this prompt; MTP4 is **4.89%
+above MTP3**. Each window produces *different text and lengths*, so these are
+same-prompt throughput comparisons, not identical-output kernel speedups or a
+quality-parity result. All nine responses contain fenced, complete HTML with
+parsable inline SVG and no external asset references. MTP3 animates both the
+wheels and the pelican's leg paths via SVG animation. MTP4/5 use CSS to spin
+wheels and pedals/crank but their pelican leg and foot paths remain static,
+falling short of the requested pedaling motion. Thus **MTP3 remains the default**
+for this task; higher raw throughput alone does not justify changing it. Save
+the HTML *inside the fence*, not the surrounding explanation. Browser rendering
+and animation behavior were not independently tested. These results exclude
+model load and prefill and do not describe 85K-context decode.
+
+Reproduce the benchmark with the same local artifact and hardware:
+
+```bash
+# Start the server with one draft window (repeat for N=3, 4, 5, stopping
+# the previous server before changing N):
+N=3
+tools/v100/ninfer-v100-duo.sh model=/home/gareth/models/qwen3_8_27b_nvfp4.ninfer \
+  "draft-tokens=${N}" --no-thinking --no-prefix-reuse \
+  --request-log-jsonl "/tmp/pelican-mtp${N}.jsonl"
+# In a separate terminal, after the server is listening (set N to the same number):
+N=3
+prompt='Create a complete, self-contained HTML file containing inline SVG that depicts a pelican riding a bicycle. Animate it in 2D: the wheels spin and the pelican pedals. Use no external resources. The file should work by saving it as an .html file and opening it directly in a browser.'
+jq -n --arg prompt "$prompt" '{model:"qwen3.8-27b",messages:[{role:"user",content:$prompt}],reasoning_effort:"none",max_tokens:12288,seed:42,temperature:0}' > /tmp/pelican-request.json
+for run in 1 2 3; do
+  curl -fsS -H 'Content-Type: application/json' \
+    --data-binary @/tmp/pelican-request.json \
+    http://127.0.0.1:8080/v1/chat/completions > "/tmp/pelican-mtp${N}-response-${run}.json"
+done
+jq -c 'select(.event=="request_done") | {finish:.result.finish_reason,output:.result.completion_tokens,decode_seconds:.timings_seconds.decode,decode_tok_s:((.result.completion_tokens-1)/.timings_seconds.decode)}' "/tmp/pelican-mtp${N}.jsonl"
+# To reproduce the 5-second peak, retain stdout/stderr from the server and
+# take the maximum decode=...tok/s from its throughput interval=5.000s lines.
+```
+
+An initial three-run attempt with `max_tokens: 3072` stopped at the output
+limit in all three runs and truncated the HTML (about 121.3 decode tok/s);
+those runs are **excluded** from the complete-output comparison above. An
+earlier two-run MTP3 campaign measured 122.304 / 122.310 tok/s with the
+same prompt and output; the table is the subsequent matched three-run campaign.
+
+## V100 Duo text concurrency
+
+On **September 29, 2026**, with 2 × Tesla V100-SXM2 **16 GB**, CUDA **12.8**,
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer`, TP2, INT8 KV, optimized MTP3
+and CUDA Graphs, public Engine startup checks established the following
+**text-only** capacity points. The KV column is the *total shared* Main Text KV
+pool, not a per-request allotment. All explicit-KV entries set it equal to the
+per-request ceiling so that a single request can still fill that ceiling;
+several near-ceiling requests cannot run at once.
+
+| Slots | Prefill chunk | Context / shared KV | Primary free after startup | Result |
+|---:|---:|---:|---:|---|
+| 2 | 4,096 | 155,648 | 703 MiB | starts; two short HTTP completions form actual two-row decode batches |
+| 2 | 4,096 | 176,128 | 231 MiB | starts; little margin |
+| 2 | 4,096 | 180,224 | — | rejected: runtime reservation exceeds available budget by about 2.4 MB |
+| 2 | 1,024 | 180,224 | 449 MiB | starts; not near-ceiling generation-qualified |
+| 2 | 1,024 | 200,000 | — | rejected: runtime reservation exceeds budget |
+| 4 | 1,024 | 131,072 | 1,253 MiB | starts; benchmarked with four simultaneous short requests |
+| 4 | 1,024 | 163,840 | 495 MiB | starts; not near-ceiling generation-qualified |
+| 4 | 1,024 | 180,224 | — | rejected: runtime reservation exceeds budget |
+
+At 155,648/4,096/two slots, `--kv-capacity auto` did not start; at
+131,072/1,024/four slots, `auto` also did not start because it keeps 1 GiB of
+planned sizing headroom. Explicit KV avoids that *planning* margin but does not
+create extra physical memory. These rows bracket the tested startup boundaries,
+not a proven exact maximum or a full-length multi-request qualification. The
+README recommends profiles with greater free-memory margin.
+
+For comparable **text-only multi-request throughput**, fix the same
+131,072-token context, 131,072-token explicit shared KV and 1,024-token
+prefill chunk at all slot counts (1, 2 and 4). Each slot uses the same
+512-token prefix of `bench/fixtures/bench_corpus.ids` and greedy sampling,
+disables prefix reuse and model-default stopping, and emits exactly 513 tokens
+(first token during prefill plus 512 decode tokens). Submit each set of requests
+simultaneously through the public Engine, discard one warmup set and measure
+five sets. Wall time begins at submission and ends when all requests complete;
+it excludes model load but includes prefill and decode. Aggregate output rate
+is `slots × 513 / wall seconds`. This fixed synthetic window measures throughput,
+not response quality or performance at 131K occupied context.
+
+| Simultaneous requests | Primary free at startup | Mean set time (5 runs) | Mean aggregate output rate | Mean decode batch |
+|---:|---:|---:|---:|---:|
+| 1 | 1,749 MiB | 7.523 s | 68.19 tok/s | 1.00 |
+| 2 | 1,585 MiB | 9.146 s | 112.18 tok/s | 1.99 |
+| 4 | 1,253 MiB | 14.381 s | 142.69 tok/s | 3.57 |
+
+The aggregate rate is the mean of the five per-set rates, **1.65×** and
+**2.09×** the one-slot rate for two and four requests, respectively. Recorded
+decode-row/round counts establish actual multi-row execution. All measured
+outputs contain exactly 513 token IDs and repeat at each fixed slot position
+across runs; the four-slot greedy outputs differ across slots and from the one/two-slot
+result beginning at token 7 or 8, so this is **not** a quality-equivalence
+qualification. The saved local diagnostic measurements are under
+`profiles/bench/text_concurrency_20260929/` (ignored, not a distributed
+fixture). The four-slot command in the README retains this measured 131K
+ceiling; a 163,840-token four-slot startup is not a benchmarked recommendation.
+
+## V100 Duo Vision and concurrency
+
+Verified on **September 29, 2026**, using two Tesla V100-SXM2 **16 GB** cards,
+CUDA **12.8**, `sm_70`, and the explicitly selected official artifact
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer` (`qwen3.8-27b/nvfp4`). This is a
+functional serving qualification, not a vision-accuracy benchmark or a sustained
+throughput comparison.
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
+  --vision --max-context 16384 --prefill-chunk 1024 \
+  --max-concurrency 2 --kv-capacity auto \
+  --port 18081 --no-thinking --greedy \
+  --request-log-jsonl /tmp/ninfer-vision.jsonl --log-stats-interval-ms 500
+```
+
+Run the deterministic-scene checker against that dedicated idle server with
+Python 3.11 (the verification interpreter was `/tmp/ninfer-py311/bin/python`):
+
+```bash
+/path/to/python3.11 tools/v100/check_vision_http.py --request-log /tmp/ninfer-vision.jsonl
+```
+
+Startup completed with **32,768 shared Main Text KV tokens**, sufficient for two
+16,384-token entitlements; primary-rank runtime reservation was **2.76 GiB** and
+actual primary-rank free memory after startup was **2.10 GiB**. INT8 KV, optimized
+MTP3 and CUDA Graph were enabled. These memory figures qualify startup capacity,
+not generation at the full context frontier.
+
+The checker creates independent PPM fixtures: a red circle and a blue square on
+white backgrounds. It requires the correct shape, color and background, not
+exact wording. All **six** real HTTP requests passed:
+
+| Request | Prompt tokens | Completion tokens | HTTP first content |
+|---|---:|---:|---:|
+| Red circle, 384 × 384 | 174 | 12 | 0.581 s |
+| Blue square, 384 × 384 | 174 | 12 | 0.544 s |
+| Blue square, 1280 × 1280; crosses prefill chunks | 1,630 | 13 | 4.042 s |
+| Both images in one request | 318 | 122 | 1.039 s |
+| Concurrent red-circle request | 189 | 384 | 0.543 s |
+| Concurrent blue-square request | 189 | 384 | 1.126 s |
+
+Each row is one request, not an average or percentile. HTTP first-content latency
+includes local HTTP/media preparation and streaming; it excludes startup/model
+load. The concurrent pair finishes at 6.107 s and 6.396 s from each request's
+start, both at their 384-token output limit. Their content-stream intervals
+overlap, and structured throughput records report **average decode batch size
+2.00** during joint decoding. This establishes actual batched concurrent Vision
+generation, not two successful but sequential HTTP responses. Every completion
+record reports nonzero Vision time and there are no request errors or rejections.
+
+A separate ordinary-decoding server (same 16K/two-slot Vision profile, INT8 KV and
+CUDA Graph, but **without** `--spec` or `--lm-head-draft`) also passed all six
+HTTP checks, including actual decode batch size **2.00**. Its startup resolved
+the same 32,768-token KV pool with **2.53 GiB** primary-rank free memory. Thus
+Vision concurrency is exercised with and without the speculative backend.
+
+The retained public-Engine TP2 test additionally covers cross-chunk media lifetime,
+MTP shifted visual embeddings, same-media reuse without re-encoding, changed and
+appended media, and a visual prefix bridge against cold full prefill. See
+[test commands](../tests/README.md). The 8,192-token/two-slot Vision profile also
+passed the same six HTTP checks. The README's 32 GB/four-slot profile is a tuning
+starting point, **not a hardware-verified result**; no 32 GB GPU is available here.
+
+### TP2 Vision context capacity
+
+The initial 16K/two-slot Vision profile above was a conservative functional
+qualification, **not a measurement of the maximum context**. Before the
+independent `--vision-max-tokens` budget was added, public Engine startups on
+the same hardware, artifact, INT8 KV, optimized MTP3 and 1,024-token prefill
+chunks gave these historical default-visual-budget results:
+
+| Vision context / slots | KV policy | Resolved shared KV | Primary free after startup | Result |
+|---|---|---:|---:|---|
+| 16,384 / 2 | auto | 32,768 | 2.10 GiB | starts |
+| 24,576 / 2 | auto | 44,288 | 1.14 GiB | starts; not two full ceilings |
+| 24,576 / 2 | explicit 49,152 | 49,152 | 1.06 GiB | starts; two full ceilings |
+| 32,768 / 2 | auto | — | — | rejected: minimum runtime plus 1 GiB headroom exceeds budget |
+| 32,768 / 2 | explicit 32,768 | 32,768 | 0.56 GiB | starts; one full ceiling only |
+| 32,768 / 2 | explicit 65,536 | — | — | rejected: runtime exceeds available memory |
+| 49,152 / 1 | explicit 49,152 | 49,152 | 0.44 GiB | starts; little headroom |
+| 65,536 / 1 | explicit 65,536 | 65,536 | 0.17 GiB | starts; not recommended |
+| 180,224 / 1 | auto | — | — | rejected: runtime exceeds available memory |
+
+These are startup/admission observations, not full-context generation tests
+except where explicitly noted below. `auto` retains **1 GiB of planned sizing
+headroom**; explicit capacity bypasses that policy but cannot bypass actual
+memory requirements. Planned sizing headroom and measured free memory differ
+because graph reservation is a bound, not necessarily fully allocated memory.
+
+These runs planned Vision workspace for
+`min(max_context, 32768)` **merged visual tokens** (four patches per token),
+with a separate visual-output transient reservation. It is not sized to the
+small image used by an individual request. At the verified 24K/two-slot explicit
+profile, primary weights occupy **10.73 GiB**, shared scratch **2.28 GiB**, and
+the complete runtime reservation **3.81 GiB**. Raising context to 32K increased
+the worst-case Vision reservation as well as text KV and per-slot state. This
+explained the old 16K/24K recommendation; it did **not** establish a 24K ceiling
+for a text-heavy Vision workload.
+
+The 24K/two-slot explicit 49,152-token profile also passed all six real HTTP
+Vision checks (single image, cross-chunk image, multiple images and two
+concurrent streams). Its concurrent decode records report batch size **2.00**.
+Two additional simultaneously submitted image requests each occupied **22,180
+prompt tokens** (repeated text filler plus a 384 × 384 image), requested at most
+128 output tokens, and finished normally with 15 tokens identifying the correct
+color, shape and background. Their text prefill phases took **22.65 / 22.66 s**;
+HTTP first content arrived at **22.93 / 45.87 s** because prefill work is
+scheduled on the shared executor. This verifies long occupied context with
+Vision for this workload, not near-ceiling sustained decode throughput or a
+guarantee of simultaneous long-prefill execution.
+The current Engine independently bounds merged visual tokens per request through
+`--vision-max-tokens`; frontend admission and both Vision workspace and
+output-transient planning use the same bound. With 2,048 visual tokens,
+1,024-token prefill chunks, two slots and `--kv-capacity auto` on the same pair:
+
+| Context per request | Resolved shared KV | Primary free after startup | Outcome |
+|---:|---:|---:|---|
+| 131,072 | 137,920 | 1.14 GiB | starts; one full-length request fits |
+| 147,456 | — | — | `auto` rejects minimum runtime plus 1 GiB headroom |
+| 180,224 | — | — | `auto` rejects minimum runtime plus 1 GiB headroom |
+
+With the same Vision/token/TP2/two-slot profile, sizing the shared KV pool
+**explicitly to equal `max_context`** instead of asking `auto` to reserve 1 GiB
+gave these additional startups. Figures are primary-rank free memory after
+load, *not* unused KV capacity:
+
+| Per-request context and shared KV | Primary free after startup | Qualification |
+|---:|---:|---|
+| 155,648 | 0.70 GiB (715 MiB) | real near-ceiling image prompt and concurrent Vision checked |
+| 163,840 | 0.51 GiB | startup only |
+| 172,032 | 0.33 GiB | startup only |
+| 180,224 | 0.14 GiB | startup only; very little margin |
+
+The **155,648/2-slot profile** was subsequently tested through the real HTTP
+server. A 384 × 384 blue-square image plus repeated text occupied **154,771
+prompt tokens**; the 20-token output correctly identified the blue square and
+white background. Image encoding took **0.161 s**, text prefill **218.52 s**,
+decode **0.319 s**, and HTTP first content **219.15 s**. Main-card memory was
+**15,432 MiB used / 713 MiB free** both after startup and after that generation;
+the peer held **15,124 MiB used / 1,021 MiB free** at startup and **15,126 MiB
+used / 1,019 MiB free** afterward. All six real-image HTTP checks then passed
+on the same profile, including the concurrent pair with recorded average
+decode batch size **2.00**. This qualifies a near-ceiling *prefill* with short
+decode and short-prompt batched decode, **not** long-context sustained decode
+or concurrent full-length admissions. The higher-context rows were not tested
+with near-ceiling requests and have substantially less free memory.
+
+`--max-context 180224 --max-concurrency 2 --kv-capacity 180224` can start only
+with explicit sizing, leaving **0.14 GiB** free; it is not a robust recommendation
+and has not been qualified with a full-context Vision request. The 131K/2-slot
+profile does **not** divide its context in half: one request can occupy up to
+131,072 tokens, with the remaining **6,848 shared KV tokens** available for
+overlapping smaller reservations. It cannot promise two full-length requests.
+
+The recommended 131K/two-slot profile was also exercised through the HTTP
+server, not just startup sizing. One cold request with a real 384 × 384 image
+and **100,171 occupied prompt tokens** (repeated text filler) produced 30
+completion tokens, correctly identifying the red circle and white background;
+Vision encoding took **0.160 s**, text prefill **124.06 s**, and decode
+**0.355 s**. A second cold request with a blue-square image occupied **130,671
+prompt tokens** (401 below the 131,072 ceiling), produced 20 tokens correctly
+identifying its color, shape and background, and measured **174.55 s** text
+prefill, **0.160 s** Vision encoding, and **0.301 s** decode. These qualify
+near-ceiling *occupied* Vision context with a short continuation, not sustained
+long-context decode throughput. The same resident profile passed the six-request real-image checker,
+including 1,630-token cross-chunk media, a two-image request and two concurrent
+384-token streams; its concurrent decode reached **batch size 2.00**. Two
+1,280 × 1,280 images in one prompt exceeded the 2,048-visual-token budget and
+returned HTTP 400 `media_budget_exceeded`, confirming that reduced Vision
+workspace does not silently accept larger media than was planned.
+
+### TP2 Vision prefill and decode cost
+
+On the same **2 × V100-SXM2 16 GB**, CUDA 12.8 and Qwen3.8-27B NVFP4 artifact,
+the public Engine measured Vision disabled/enabled in separate resident processes.
+Both used TP2, 16,384 context, two concurrent slots, an explicit 32,768-token
+INT8 KV pool, optimized MTP3, CUDA Graph, greedy sampling and no prefix reuse.
+For each case, one warmup was discarded and **five** cold requests were measured;
+model load was excluded. Text inputs, fixed output limits and generated token IDs
+matched exactly across the Vision switch. Prefill-only cases requested nine
+output tokens (including the prefill token); the long text decode case requested
+1,025 (one prefill plus 1,024 decode). Fixed-length generation ignores model
+stop tokens; these are throughput measurements, not answer-quality comparisons.
+
+| Prefill chunk | Text prompt tokens | Vision off prefill tok/s | Vision on prefill tok/s | Change |
+|---:|---:|---:|---:|---:|
+| 1,024 | 512 | 885.56 | 884.26 | −0.15% |
+| 1,024 | 4,096 | 1,026.81 | 1,024.61 | −0.21% |
+| 1,024 | 12,288 | 1,005.03 | 1,003.21 | −0.18% |
+| 4,096 | 512 | 884.00 | 883.10 | −0.10% |
+| 4,096 | 4,096 | 1,150.12 | 1,148.64 | −0.13% |
+| 4,096 | 12,288 | 1,119.54 | 1,118.17 | −0.12% |
+
+At a fixed 1,024-token chunk, Vision-enabled **text-only** decode was
+**119.57 tok/s** versus **119.71 tok/s** disabled (−0.12%, 1,024 decode tokens).
+Two simultaneous text requests, each generating 513 tokens, formed real decode
+batches (mean batch size **1.987** in both modes); their mean wall-clock makespan
+was **5.610 s** versus **5.605 s** (+0.11%, including prefill). Enabling Vision
+therefore caused no material text-path prefill or decode slowdown in these
+workloads. Switching from a 4,096-token chunk to the README's conservative
+1,024-token Vision chunk independently reduced 4,096-token *text* prefill from
+1,150.12 to 1,026.81 tok/s with Vision off (−10.7%); this is a chunk-size
+tradeoff, not Vision encoding overhead. Vision also started with less free memory:
+**2.10 GiB** versus **3.64 GiB** at the 1,024-token chunk.
+
+Actual image requests add work *before* first-token delivery. At the 1,024-token
+chunk, a 384 × 384 PPM scene expanded to **193** prompt tokens: media preparation
+averaged **0.007 s**, Vision encoding **0.158 s**, text prefill **0.369 s**, and
+Engine TTFT **0.534 s**. A 1,280 × 1,280 scene expanded to **1,649** tokens:
+preparation **0.066 s**, Vision encoding **2.143 s**, text prefill **1.691 s**,
+and Engine TTFT **3.899 s**. TTFT excludes preparation and model load. A
+384 × 384 image prompt followed by 512 decode tokens reached **120.96 tok/s**;
+two such concurrent image requests formed decode batches (mean size **1.959**),
+finishing 1,026 combined output tokens in **5.867 s** on average, *including*
+their Vision encoding and prefill phases but excluding host-side preparation.
+Image and text continuations have different
+tokens and MTP acceptance, so their decode rates and pair makespans are **not**
+controlled measures of Vision-induced decode overhead; the identical text
+on/off comparison above is the appropriate isolation.
+
+## V100 Duo context decay
+
+On September 28, 2026, the same local **2 × V100-SXM2 16 GB**, CUDA 12.8,
+official Qwen3.8-27B NVFP4 artifact and public `ninfer_bench` Engine route
+measured TP2, 180,224-token context *capacity*, 4,096-token prefill chunks,
+INT8 KV, MTP3 with optimized draft head, CUDA Graph, greedy sampling and no
+prefix reuse. The `--code-chat` corpus generator assembled **30,000 / 50,000 /
+100,000 / 150,000 actual occupied prompt tokens** from distinct repository
+C++/CUDA source excerpts followed by the *same* bounded-queue coding task;
+thinking was disabled in the rendered prompt. Each point made **two cold
+requests, zero discarded warmups**, in a resident Engine, after decode graph
+priming. Every request emitted one token during prefill plus **1,024 measured
+decode tokens**, reaching the fixed output limit. Independent processes and
+model loads were used per context length; load time is excluded. `--capture-generation`
+retained the output for inspecting the fixed-length continuation.
+
+| Occupied prompt | Prefill seconds (two runs) | TTFT mean | Prefill tok/s mean | Decode seconds (two × 1,024 tokens) | Decode tok/s mean | MTP accepted |
+|---:|---|---:|---:|---|---:|---:|
+| 30,000 | 28.0109 / 28.0779 | 28.0451 s | 1,069.73 | 10.0072 / 10.0116 | 102.30 | 75.11% |
+| 50,000 | 49.5062 / 49.6299 | 49.5691 s | 1,008.72 | 10.5481 / 10.5506 | 97.07 | 77.02% |
+| 100,000 | 113.0494 / 113.2717 | 113.1625 s | 883.70 | 12.6322 / 12.6295 | 81.07 | 72.75% |
+| 150,000 | 192.4502 / 192.2744 | 192.3653 s | 779.78 | 14.4855 / 14.4810 | 70.70 | 72.24% |
+
+Prefill rate is the mean of each run's `prompt_tokens / prefill_seconds`;
+decode rate is the mean of each run's `1024 / decode_seconds`. TTFT is the
+Engine's `first_token_seconds` from request start, not HTTP/UI latency. At
+150K occupied tokens versus 30K, prefill throughput falls 27.1% and decode
+throughput falls 30.9% **on this controlled workload**. Context capacity
+remains 180,224 in every row; it is the *occupied* prompt that changes.
+
+This public-Engine benchmark feeds **raw pretokenized** Qwen chat-prompt IDs
+and **disables model stops** to force equal, sufficiently long decode windows.
+Captured continuations eventually repeat after an apparent natural stop, and
+some emit special-token strings such as `<think>` after the stopping point.
+Consequently these are *fixed-output performance measurements*, **not**
+natural-stop completion times, a thinking-enabled comparison, an Agent
+transcript, or evidence of 1,024 useful generated tokens. Prompt content also
+grows with length, so acceptance rates change; the rows do not isolate the
+attention kernel's complexity from continuation differences. The pelican
+section above measures actual naturally stopped generation separately.
+
+Reproduce with the same registered artifact and device configuration; all
+files after the last needed excerpt are omitted here (the generator stops
+reading once it has enough code tokens):
+
+```bash
+cmake -S . -B build-v100-duo -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build-v100-duo --target ninfer_bench ninfer_v100_corpus -j
+export LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+mkdir -p /tmp/ninfer-context-decay
+sources=(
+  src/core/host_worker_pool.h src/core/host_worker_pool.cpp
+  src/runtime/engine/concurrent_executor.h
+  src/targets/qwen3_6/impl/runtime/program_impl.h
+  src/targets/qwen3_6/impl/runtime/text_context_impl.h
+  src/targets/qwen3_6/impl/runtime/layouts_impl.h
+  src/targets/qwen3_6/impl/runtime/mtp_impl.h
+  src/ops/kernel/gqa_attention_decode_i8.cuh
+  src/ops/kernel/gqa_attention_decode_i8_tc_volta.cuh
+  src/ops/wrapper/gdn_input_proj.cpp
+)
+for length in 30000 50000 100000 150000; do
+  build-v100-duo/bench/ninfer_v100_corpus \
+    /home/gareth/models/qwen3_8_27b_nvfp4.ninfer \
+    "/tmp/ninfer-context-decay/code-${length}.ids" \
+    --code-chat "$length" --output-tokens 1024 "${sources[@]}"
+  build-v100-duo/bench/ninfer_bench \
+    --weights /home/gareth/models/qwen3_8_27b_nvfp4.ninfer \
+    --tp 2 --devices 0,1 --kv-dtype int8 --max-ctx 180224 \
+    --prefill-chunk 4096 --mtp-draft-tokens 3 --lm-head-draft \
+    --corpus "/tmp/ninfer-context-decay/code-${length}.ids" \
+    -pg "${length},1024" --warmup 0 -r 2 --capture-generation \
+    -o json --output-file "/tmp/ninfer-context-decay/result-${length}.json"
+done
+```
+
+### V100 TPX attention experiments
+
+We evaluated two ideas from `/tmp/ninfer-v100-tpx` on the **official Qwen3.8-27B NVFP4
+artifact**, 2 x V100-SXM2 16 GB over NVLink, CUDA 12.8, TP2, INT8 group-64 KV and
+4,096-token prefill chunks. All rates below are public-Engine `ninfer_bench` results, not
+the external repository's published measurements. Each point has two measured requests,
+no discarded warmup. The 85,000-token code-chat corpus was generated with
+`ninfer_v100_corpus --code-chat 85000 --output-tokens 1024` from the listed source files in
+the V100 code-corpus recipe above; the benchmark window requested one prefill token plus
+128 decode tokens with MTP3 and the optimized proposal head.
+
+| Volta prefill flash tile | Capacity | 1,024 | 10,240 | 20,480 | 85,000 | Decision |
+|---|---:|---:|---:|---:|---:|---|
+| Existing 32-column tile | 180,224 | 1,031.6 | 1,131.6 | 1,103.1 | 916.9 | Keep |
+| 32-column, 8-warp / 64-key | 180,224 | 1,027.8 | 1,114.4 | 1,079.3 | 873.9 | Reject |
+| 64-column, 8-warp / 64-key | 163,840 | 1,031.2 | 1,131.6 | 1,110.7 | 957.7 | Reject |
+
+All throughput cells are prompt tokens/s. The 64-column candidate passed the attention
+FP64-oracle suite but its workspace could not start at the existing 180,224-token capacity:
+the reservation exceeded available device memory by about 82 MB. At 163,840 capacity its
+85K rate was 4.4% above the **180,224-capacity** baseline (not a same-capacity A/B), while
+the 1K/10K/20K rates were almost unchanged. Losing at least 16,384 tokens of capacity for
+that narrowly scoped gain does not justify changing the production tile. The 32-column
+candidate kept capacity but regressed on all measured prompt lengths. Neither tile survives.
+
+For decode, the TP2 D256 12Q/2KV INT8 attention verification path now uses eight warps,
+64 keys per tile, warp-partitioned QK, PRMT INT8-to-FP16 conversion and FP32 PV accumulation
+at the admitted three-to-five-token widths. T=1/2 and other geometries retain the prior
+path. At 180,224 capacity on the 85K code prompt, the previous kernel measured
+**76.25 tok/s**, 37 rounds, 82.57% draft acceptance; the selected key-split kernel
+measured **90.87 tok/s**, 36 rounds, 85.85% acceptance (+19.2% committed decode
+throughput). Decode seconds per round fell from 45.37 to 39.13 ms, so the gain is not
+entirely explained by the acceptance change. These are two measurements per route with
+zero warmups; different outputs and draft acceptance prohibit claiming token-exact parity.
+The independent INT8 attention FP64 oracle and exact KV-cache tests pass at short and
+85K occupied contexts. One 8K MTP3 request returned identical tokens and acceptance in
+CUDA Graph and eager execution. With MTP disabled (T=1), both kernels select the old
+route: 26.48 versus 26.49 tok/s and identical 128 generated IDs at 85K.
+
+We also rejected changing long-context splits from the existing policy to 1,920 keys per
+split: even though MTP3 improved from 90.87 to 92.82 tok/s on this fixture, non-MTP
+decode fell from 26.48 to 18.08 tok/s. The shipped split policy is unchanged. These
+numbers describe the local NVFP4 code prompt, not typical agent decode acceptance or
+quality on arbitrary prompts.
+
+## V100 Duo GSQ-RCO IQ3_S GGUF-blocks
+
+On 2026-10-01 the public `ninfer-serve` route was also checked with the same
+GSQ artifact on two V100-SXM2 16 GB cards. TP2, INT8 KV, MTP3, the optimized
+draft head, CUDA Graph, 4,096-token prefill chunks, greedy sampling and two
+text slots were used. Explicit Main Text KV capacities distinguish a native
+262,144-token *per-request ceiling* from two independent full-context KV
+entitlements:
+
+| Per-request ceiling | Shared KV tokens | Result |
+|---:|---:|---|
+| 262,144 | 524,288 | Startup rejected: runtime reservation 12,063,633,152 B exceeds available 10,154,556,416 B |
+| 262,144 | 262,144 | Started; 2.74 GiB free per GPU; two short requests decoded concurrently |
+| 200,000 | 400,000 | Started; 811 MiB free per GPU; two short requests decoded concurrently |
+
+To find the highest shared KV pool with the **262,144-token per-request
+ceiling fixed**, the same two-slot, 4,096-chunk configuration was started
+repeatedly on 2026-10-01 (one server at a time):
+
+| Shared KV tokens | Mode | Observed result |
+|---:|---|---|
+| 358,016 | `auto` | Started; 1.13 GiB physically free, 1 GiB planned headroom |
+| 409,600 | explicit | Started; 277 MiB physically free; two short HTTP requests each produced 128 tokens |
+| 417,792 | explicit | Started; 137 MiB physically free; two short HTTP requests each produced 128 tokens |
+| 417,856 | explicit | Started; 137 MiB physically free, 0.38 MiB planned slack; two short HTTP requests each produced 128 tokens |
+| 417,920 | explicit | Rejected: 10,154,114,816 B reservation > 10,153,361,408 B available |
+
+The Main pool allocates 64-token pages, so the last two explicit points are
+adjacent allocation sizes. Startup budgets varied slightly between runs; the
+one-page boundary is an **observed ceiling in this run**, not a stable safe
+setting. At 417,856 tokens, the primary GPU had only 137 MiB free after graph
+setup. Prefer `auto` for its 1 GiB sizing headroom, or leave ample explicit
+margin rather than using the measured edge. Two concurrently *occupied* long
+contexts were not measured.
+
+The same hardware, artifact, TP2/MTP3/INT8 KV, 4,096-token chunk and native
+262,144-token per-request ceiling were also measured at **three text slots**
+on 2026-10-01. Only one server was resident at a time:
+
+| Shared KV tokens | Mode | Result |
+|---:|---|---|
+| 344,256 | `auto` | Started; 1.20 GiB physically free; three 31-token prompt / 256-output requests completed in 9.62–9.78 s, with decode batches reaching size 3.00 |
+| 400,000 | explicit | Started; 273 MiB free, 70.32 MiB planned slack; three 31-token prompt / 256-output requests completed in 9.64–9.79 s, with decode batches reaching size 3.00 |
+| 403,968 | explicit | Started; 205 MiB free; three short requests completed |
+| 404,032 | explicit | Started; 203 MiB free; three short requests completed |
+| 404,096 | explicit | Started; 201 MiB free, 0.19 MiB planned slack; three short requests completed in 9.63–9.78 s, decode batches reaching size 3.00 |
+| 404,160 | explicit | Rejected: 10,154,307,328 B reservation > 10,153,361,408 B available |
+| 404,224 | explicit | Rejected: 10,155,456,256 B reservation > 10,154,556,416 B available |
+
+The highest observed working pool, 404,096 tokens, and rejected adjacent
+64-token page are a **run-specific memory boundary**: even the 400,000-token
+explicit profile leaves only 273 MiB physically free. The `auto` capacity
+retains its 1 GiB planning headroom and is the safer starting point when
+the larger shared pool is unnecessary. This checks three *short* concurrent
+requests, not three occupied long contexts or the exact maximum on every startup.
+
+Vision support for this GSQ artifact was verified with the same TP2, INT8 KV,
+MTP3 and three-slot configuration, using the v3 Vision tower and merger weights
+projected without runtime repacking:
+
+| Vision profile (262,144 context ceiling) | Shared KV | Startup/result |
+|---|---:|---|
+| `--prefill-chunk 4096 --vision-max-tokens 2048` | 400,000 | Rejected: 10,100,664,064 B runtime reservation > 9,858,836,992 B available |
+| `--prefill-chunk 1024 --vision-max-tokens 2048 --kv-capacity auto` | 344,832 | Started with 1.20 GiB free per GPU and 1 GiB planned headroom; real-image checks passed |
+| `--prefill-chunk 1024 --vision-max-tokens 2048 --kv-capacity 400000` | 400,000 | Started with 283 MiB free per GPU, 80.33 MiB planned slack; real-image checks passed |
+
+For both successful profiles, `tools/v100/check_vision_http.py` passed all
+six requests via public HTTP serving: red-circle and blue-square 384 × 384
+images, a 1280 × 1280 image spanning prefill chunks, two images in one prompt,
+and two concurrent long-form image responses. It checks scene semantics, not
+pixel-level model accuracy. At 400K shared KV, three additional concurrent
+real-image requests each completed a 384-token continuation and the server
+recorded decode batch size **3.00**; all requests identified the depicted shape
+and color correctly. This does not establish correctness or speed with three
+near-full contexts occupied. The 400K setting has little startup margin; `auto`
+is safer when maximum shared KV capacity is not required.
+
+### V100 DFlash2 Op measurements (not end-to-end)
+
+On 2026-10-01, one Tesla V100-SXM2-16GB (CUDA 12.8, `sm_70`) measured the
+production public Ops using cold-cache CUDA Graph launches, 256 MiB cache flush,
+30 repetitions, three requests, seven proposals per request (`W=8`, `T=24`):
+
+| Op | Shape | Median latency |
+|---|---|---:|
+| candidate selector | 16 candidates, 7 steps, greedy | 89.088 µs |
+| candidate selector | 16 candidates, 7 steps, stochastic | 102.400 µs |
+| dynamic grouped conv prepare | 5120 hidden, 1280 BF16 control rows | 123.904 µs |
+| dynamic grouped conv add | 4096 input channels, W8 | 105.472 µs |
+| dynamic grouped conv add | 17408 input channels, W8 | 525.312 µs |
+| symmetric SWA (TP2 rank) | 16Q/4KV, 2048 window, FP16 context V | 1,338.368 µs |
+| draft QKV (TP2 rank) | W8 `[3072,5120]` → Q2048/K512/V512, T=24 | 294.912 µs |
+| draft QKV (TP2 rank) | same, T=48 | 324.608 µs |
+| feature projection (TP2 rank) | W8 `[5120,12800]`, T=24 | 388.096 µs |
+| attention output projection (TP2 rank) | W8 `[5120,2048]`, T=24 | 58.368 µs |
+
+Reproduction: `build-v100-duo/bench/ninfer_candidate_selector_bench --steps 7
+--batch 3 --repeat 30`, `build-v100-duo/bench/ninfer_dynamic_grouped_conv_prepare_bench
+--width 8 --batch 3 --repeat 30`, and
+`build-v100-duo/bench/ninfer_linear_dynamic_grouped_conv_add_bench --width 8
+--batch 3 --k 4096 --repeat 30` (repeat for `--k 17408`). The BF16 control
+projection now reuses its weight rows across groups of eight columns rather
+than using a separate matvec per column; its full numerical test passes.
+The SWA value is `build-v100-duo/bench/ninfer_swa_dflash2_bench --width 8
+--batch 3 --context 2048` with the same cold-cache protocol; at a 96-token
+context it measures 108.544 µs and at 2048 it uses two graph nodes. A
+64-way rather than 32-way KV split measured 1,388.544 µs and was discarded.
+For the dedicated DFlash2 route, reducing the 2048-context split capacity
+from 32 to 16 or 8 measured 1,348.608 / 1,338.368 µs (W=8/B=3), while
+4 splits regressed to 1,566.720 µs. The 8-split variant measured
+2,595.840 µs at W=16/B=3/context2048, 623.616 µs at
+W=8/B=3/context1024, and 99.328 µs at context96. Earlier 32-split
+W=16/B=3/context2048 measured 2,476.032 µs, so the 8-split
+configuration is not universally faster; only W=8/B=3 selects eight splits.
+The W=16/B=3 route retains 32 splits (remeasured 2,478.080 µs), and
+W=8/B=1 and B=8 retain 32 splits (450.560 / 3,240.960 µs at context2048).
+All choices need a full-round speed check once Program exists.
+QKV values use `build-v100-duo/bench/ninfer_dflash2_tp2_attn_input_bench`
+with the same cold-cache protocol; T=1/8/32 measured 45.056/106.496/347.136 µs.
+T=24 uses one fused SIMT launch; T=32/48 use three section-local Tensor Core
+launches. The initial all-SIMT T=48 route measured 574.464 µs and was replaced;
+the three-launch Tensor Core route at T=24 measured 343.040 µs and was discarded.
+These are single-rank Op results, not an inference-speed comparison.
+The last two Linear values use `build-v100-duo/bench/ninfer_linear_bench
+--qtype w8 --n 5120 --k 12800 --t 24 --warmup 4 --repeat 30` (change
+`--k` to `2048` for attention output). Feature T=1/8/48 measured
+147.456/219.136/380.928 µs; attention output T=48 measured 71.680 µs.
+The benchmark prints RTX 5090 reference-bandwidth columns; only the actual
+V100 device and directly measured latency are applicable here. TP2 collective
+costs and the five-layer schedule are not part of these Linear measurements.
+These figures do **not** include the five-layer draft, context KV, TP2
+collectives, target verification, prefill, or request scheduling; they cannot
+establish DFlash2-versus-MTP throughput.
+
+The real GSQ v3 companion's 66 tensors contain 2,226,792,960 payload bytes;
+its standalone TP2 shard plan places 1,307,650,560 bytes per rank, including
+replicated selector codebooks required for arbitrary candidate-ID lookup.
+The real two-GPU binding test also loaded complete Vision + Text + optimized
+proposal + DFlash2 weights **without MTP**, checked both rank-local model views
+and compared its weight-arena footprint against the identical Vision + Text +
+optimized proposal + MTP profile:
+
+| Weight arena | Rank 0 | Rank 1 |
+|---|---:|---:|
+| MTP selected | 6,741,169,664 B | 6,445,450,240 B |
+| DFlash2 selected | 7,874,585,600 B | 7,578,866,176 B |
+| Increase | 1,133,415,936 B | 1,133,415,936 B |
+
+These are **weight-only** figures, not the memory of a running DFlash2 Engine.
+DFlash2 now loads the companion and runs TP2 decode; the earlier Vision + MTP +
+400K KV profile (283 MiB free per rank) is **not** a DFlash2 memory profile and
+must not be reused without a separate capacity measurement.
+
+#### DFlash2 versus MTP3: one-request decode
+
+Measured October 2, 2026 on 2 × V100-SXM2 16 GB, CUDA 12.8, GSQ-RCO IQ3_S v3,
+TP2, INT8 KV, CUDA Graph, optimized proposal head, 2304 max context and 256
+prefill chunk. The same counting-prompt fixture produces 128 output tokens,
+including one prefill token; the reported decode interval measures 127 output
+tokens. The independent three-repetition unprofiled probe yields **96.4 tok/s
+for MTP3** and **43.7 tok/s for DFlash2-K7**. The single-request probes below
+measure `GenerationTimings.decode_seconds` and report the corresponding
+accepted-draft counts; Nsight tracing perturbs elapsed time, so their rates are
+diagnostic rather than the published steady-state comparison.
+
+| Graph route | Decode seconds, 127 tokens | Rounds | Accepted / drafted | First position accepted / rounds |
+|---|---:|---:|---:|---:|
+| MTP3 | 1.318 | 42 | 85 / 125 | 40 / 42 |
+| DFlash2-K1 | 2.789 | 81 | 45 / 81 | 45 / 81 |
+| DFlash2-K3 | 2.534 | 67 | 59 / 201 | 38 / 67 |
+| DFlash2-K7 | 2.911 (traced) | 59 | 68 / 396 | not recorded |
+| DFlash2-K15 | 4.305 (traced) | 49 | 78 / 677 | not recorded |
+
+The bottleneck is **both** acceptance and cost per round. K3 requires 67
+target verify rounds versus MTP3's 42, while its mean decode round takes
+about 37.8 ms versus MTP3's 31.4 ms. Position one is accepted in 38/67 DFlash2
+rounds versus 40/42 MTP rounds; widening the block leaves much of its target
+verification and five-layer draft computation unused after early rejection.
+Nsight Systems node-level tracing of K3 shows the global top-16 kernel at
+approximately 3.67 ms per rank per round (136 calls across two devices) and
+many GGUF small-column vector kernels in the five-layer draft and target.
+These GPU kernel sums include both ranks and cannot be added to get wall time.
+No measured DFlash2 speedup over MTP is established. The scope here is one
+short counting prompt, not general model quality or three-request throughput.
+
+On October 2, 2026, a 1024-row tiled, parallel-reduction top-16 implementation
+passed the independent `ninfer_linear_topk_test` and the real Engine K15/B3
+Graph + Vision regression. On the same artifact and K3/B1 Graph fixture, its
+single 127-token decode interval was **2.292 s** (67 rounds, 59/201 accepted),
+down from 2.534 s before this change. A separate three-repetition, unprofiled
+decode-only comparison measured **55.45 tok/s for DFlash2-K3** and **96.36 tok/s
+for MTP3**. These are different K settings from the earlier K7 comparison; the
+older table and kernel trace describe the pre-optimization implementation.
+The improvement does not overcome the lower DFlash2 acceptance or other
+per-round costs; it establishes no DFlash2 speed advantage over MTP3.
+
+On October 2, 2026, a separate unprofiled B=3 probe on the same two V100-SXM2
+16 GB GPUs, CUDA 12.8 and GSQ v3 artifact used INT8 KV, Graph, the optimized
+proposal head, a 2304-token per-request context and three repetitions of three
+simultaneously submitted 128-output-token requests. Wall-clock aggregate output
+rates were **66.12 tok/s for DFlash2-K3** (612 request-rounds, 522/1836 accepted
+drafts) and **21.57 tok/s for DFlash2-K7** (519 request-rounds, 615/3543
+accepted drafts). These rates include request submission and prefill, unlike
+the B=1 decode-only comparison; K7 saves rounds but pays substantially more
+per round on this workload. The planned paired B=3 MTP3 Graph control did not
+start: its Graph preparation consumed 41,943,040 bytes on device 0 against a
+37,748,736-byte planned allowance. Consequently this B=3 probe compares K3
+and K7 only; it establishes neither a B=3 DFlash2-versus-MTP3 ratio nor
+general behavior on longer prompts or contexts.
+
+#### NVFP4 companion: one-request DFlash2 versus ordinary and MTP3
+
+Measured October 2, 2026 on 2 × V100-SXM2 16 GB, CUDA 12.8, the explicit
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer` v3 artifact with its embedded
+DFlash2 companion, TP2, INT8 KV, Graph, optimized proposal head, 2304 max
+context, 256 prefill chunk and the same counting-prompt fixture. Each route
+warmed up for 16 tokens and generated 128 output tokens three times; rates
+count only the 127-token decode interval per repetition, not loading or prefill.
+The real Engine test also compared the 24-token greedy DFlash2 result to the
+ordinary route and exercised B1 integration state/reuse checks.
+
+| Route | Three-repeat decode tok/s | Versus ordinary | Versus MTP3 |
+|---|---:|---:|---:|
+| Ordinary (no speculation) | 42.20–42.21 | 1.00× | 0.34× |
+| DFlash2-K3 | 69.81 | **1.65×** | 0.57× |
+| DFlash2-K7 | 68.26 | **1.62×** | 0.56× |
+| MTP3 | 122.45–122.48 | **2.90×** | 1.00× |
+
+NVFP4 thus delivers a real DFlash2 gain over ordinary decode on this fixture,
+but K3 and K7 remain slower than MTP3. K7 does not recover the difference.
+This is a short greedy B1 result, not a long-context or concurrent-service
+speed claim. Unlike GSQ's GGUF output head, the NVFP4 artifact's optimized
+proposal uses Q4G64; the current TP2 DFlash2 top-16 path only supports that
+optimized head for this profile, not its FP8 full vocabulary head. Its DFlash2
+companion matrices remain W8, not NVFP4.
+
+On the same dual-V100 GSQ v3 counting-prompt fixture, a further unprofiled
+three-repetition, 127-token decode-only sweep of startup-fixed K=1,2,3 with
+Graph, B1, optimized head and INT8 target KV measured **51.19 / 55.01 /
+55.42 tok/s**, respectively; the paired MTP3 controls were 96.32 / 96.37 /
+96.40 tok/s. The real Engine integration checks passed for all three K.
+Reducing draft width to one or two does not improve this one-request workload
+over K3, so merely shortening the five-layer proposal is not a demonstrated
+remedy for its end-to-end throughput. The earlier traced K3 run attributes
+roughly 3.16 s summed across both devices to 51,682 GGUF vector launches;
+that sum is not elapsed wall time or an isolated draft cost. Further GGUF
+kernel changes need a matched whole-inference speed measurement, not just a
+single-Op microbenchmark.
+
+On the same 2 × V100-SXM2 16 GB / CUDA 12.8 GSQ v3 artifact and K3/B1 Graph
+counting-prompt fixture, a specialized Q4_K A16 vector route uses two warps
+instead of four for vocabulary-height segments with 2–4 columns; other GGUF
+formats and the A8 route retain their existing dispatch. At the Q4_K
+`[124160,5120]` TP2 output-head benchmark shape and T=4, A16 projection
+fell from **1978.42 to 1487.51 µs** (one-rank Op timing); the neighboring
+IQ3_S `[17408,5120]` T=4 A8 path measured 141.41 / 141.77 µs.
+Independent stored-block decode with an FP64 dot oracle on the actual
+`[65536,5120]` optimized-head shard at T=2/3/4 passed, as did the real
+K3/B3 Graph + Vision integration check. Same-command three-repetition
+unprofiled K3/B1 decode-only measurements were **55.4185 before** and
+**57.0249 tok/s after**, with MTP3 controls of 96.3662 and 98.3277 tok/s.
+Both routes sped up in the latter session; the ~2.9% raw DFlash2 change is
+not wholly attributable to the kernel. The ratio to the MTP3 control moved
+from 0.5751 to 0.5799, or roughly 0.8% relative. This is a small
+workload-specific improvement, not a general DFlash2-versus-MTP advantage;
+larger or long-context workloads need their own verification.
+
+Further one-rank Q4_K A16 T4 launch-geometry controls on the same V100 used
+2 warps × 8 rows (1570.00 µs) and 1 warp × 4 rows (1389.67 µs), versus
+the retained 2 warps × 4 rows (1487.51 µs). The 2 × 8 variant was discarded.
+The 1 × 4 variant keeps the stored-block decode and arithmetic unchanged;
+the independent FP64 GGUF oracle passes at the real `[65536,5120]` optimized
+head shape for T=2/3/4, and K3/B3 Graph + Vision passes. An unprofiled
+K3/B1 three-repeat decode-only run measured 57.3214 tok/s versus 57.0249
+tok/s for the earlier 2 × 4 route, with paired MTP3 controls of 98.6012
+and 98.3277 tok/s, respectively. The relative-control difference is under
+0.3%; no robust inference-speed improvement over the 2 × 4 route is
+established from these sessions, despite the reproducible Op improvement.
+Holding the 1 × 4 launch fixed and prefetching four Q4_K blocks per stage
+instead of two measured **1703.32 µs** at the same T4 head shape; it was
+rejected and the two-block code restored. A rebuild and `ninfer_gguf_test`
+passed after the restore. This Op result does not justify another full decode
+speed claim.
+Reading Q4_K blocks directly from global memory instead of the shared-memory
+weight stage also lost at the same T4 head shape (1554.59 µs versus
+1389.67 µs with staging), so that experiment was removed as well.
+
+A same-prompt K3/B1 Graph control with the **full** proposal head produced
+55/212 accepted drafts in 71 rounds, with 37/71 at position one; its
+127-token decode interval was 2.497 s. The optimized head produced 59/201 in
+67 rounds, with 38/67 at position one (2.292 s). Thus removing the 131072-row
+shortlist does not recover the missing first-position acceptance on this
+fixture; the head also costs more to evaluate. This comparison does not
+establish why the draft disagrees with the target.
+
+Nsight Systems node traces on the optimized-head K3 route show the tiled
+top-16 kernel falling from 3.663 ms to 0.057 ms per rank call; the new finish
+stage adds 0.019 ms per rank call. Across both GPUs and 67 rounds, the sum of
+top-16 GPU-kernel durations falls from 499.6 to 11.8 ms. The sum of GGUF
+vector-kernel durations remains about 3.16 s across 51,682 launches in both
+traces. GPU sums from two cards are **not** wall time and must not be read as
+the elapsed cost of an isolated stage; the unprofiled 55.45 tok/s comparison
+above establishes the end-to-end result. The five-layer draft has no
+independent real-checkpoint numerical oracle yet, so low acceptance cannot
+be assigned to model quality, quantization, or a specific implementation error.
+
+Additional same-prompt controls after the top-16 change (single 127-token
+decode, K3/B1 Graph) give 70 rounds and 56/210 accepted drafts with BF16
+target KV, versus 67 rounds and 59/201 with INT8 target KV; first-position
+acceptance was 38 rounds in either case. These are separate generated
+trajectories, not matched-token numerical comparisons. An INT8-KV K7 run
+needed 58 rounds and accepted 68/396 drafts, with per-position acceptances
+`34,14,5,5,4,3,3`: the extra positions save nine verify rounds relative to
+K3, but add five-layer draft and target verification work every round. Its
+single decode interval was 2.702 s under the profiling fixture, versus
+2.292 s for K3. Neither changing KV storage nor increasing K establishes
+the cause of the low first-position acceptance.
+
+The artifact's conversion report records 21 DFlash2 `q8_g32_fp16`
+`grouped_absmax` matrices derived from the companion checkpoint and 45
+direct BF16 companion objects. The target Text GGUF matrices retain their
+mixed IQ/GGUF formats. Compared with a BF16-companion/BF16-target run this
+is a distinct numerical pairing; it is a plausible source of lower draft
+agreement, **not** a demonstrated cause. The original BF16 companion files
+are not available on this host, and no matched-input, layer-by-layer
+real-checkpoint oracle has been run. Do not attribute a correctness bug or
+quantization loss from the acceptance figures alone.
+
+The same K3/INT8-KV optimized-head fixture run **eager** instead of Graph
+gave 68 rounds, 58/204 accepted drafts and 37/68 first-position accepts
+(2.301 s); Graph gave 67 rounds, 59/201 and 38/67 (2.292 s). These are
+separate trajectories; the similar result is evidence against a Graph-only
+acceptance regression, not a per-token Graph/eager equivalence proof.
+
+For an unprofiled three-repetition K7/B1 Graph decode-only comparison after
+the top-16 change, the same 127-token counting-prompt fixture measured
+**47.05 tok/s DFlash2-K7** versus **96.30 tok/s MTP3**. The K3 result above
+is therefore faster than K7 on this fixture even after removing the earlier
+top-16 bottleneck; K7's extra verify/draft columns do not pay for themselves.
+
+With the opt-in `NINFER_DFLASH2_INSPECT_FIRST=1` readback on the same K3/B1
+Graph INT8-KV counting prompt, excluding the four warmup rounds leaves 67
+measured rounds. The target first-position greedy argmax appears in the
+draft's unary top-16 on **62/67** rounds; the selector chooses it on **38/67**.
+Of the 29 first-position misses, **24** have the target token in the top-16,
+and **5** do not. Target argmax is the highest unary-score candidate in 32
+rounds; the selector chooses that token on all 32 and adds six successful
+non-top-1 choices. Thus simply replacing the selector with unary top-1 would
+reduce, not improve, first-position matches on this trajectory. The 24
+in-support misses motivate comparing edge scores and target preferences on
+the **same hidden states**; top-16 membership alone is not an oracle for
+which path the companion ought to prefer. This is one greedy counting prompt,
+not an acceptance estimate for other workloads. Device readback is diagnostic
+only and is excluded from the throughput numbers.
+
+An additional **eager** K3/B1 run on the same counting prompt enabled both
+`NINFER_DFLASH2_INSPECT_FIRST=1` and `NINFER_DFLASH2_INSPECT_EDGE=1`.
+Excluding its four warmup rounds leaves 68 rounds, 58/204 accepted drafts,
+37/68 first-position matches, and 63/68 first-position target tokens in the
+unary top-16. For every measured round, a CPU FP64 sum of the stored BF16
+predecessor codebook, projected hidden, and successor codebook, added to the
+emitted FP32 unary score, selected the **same first token** as the GPU
+selector (68/68). In the 26 in-support first-position misses, the selected
+token's recomputed edge exceeded the target token's edge by 0.0614 / 1.3797 /
+6.9768 (minimum / median / maximum), whereas the BF16 target logit favored
+the target token by 3.375 / 5.125 / 30.125. This argues against a gross
+candidate-ID, codebook orientation, or first-position selector-reduction
+error; it does **not** independently validate the draft's five-layer hidden,
+W8 companion weights, or agreement with a BF16 companion. The eager and Graph
+runs are separate generated trajectories, and both diagnostics synchronize
+and read device data: their elapsed times are not speed measurements. The
+next numerical question is whether the draft hidden and unary logits agree
+with an independent companion calculation on matched features; no original
+BF16 companion checkpoint is present locally.
+
+As a **recorded-first-position counterfactual only**, multiplying the
+reconstructed edge interaction by 2 instead of 1 selects the target greedy
+argmax on 42/68 rather than 37/68 counting-prompt rounds. A separate eager
+K3/B1 128-output run with the fixed prompt “Write a short story about a
+lighthouse keeper on a stormy night.” had 64 measured rounds after six warmup
+rounds, 63/191 accepted drafts and 37/64 first-position matches; the target
+was in the unary top-16 on 60/64, and the CPU recomputation reproduced the
+GPU first choice on all 64. On those recorded rows, doubling the interaction
+still matches only 37/64, while unary-only matches 40/64. These are
+**different prompts** and fixed-prefix what-ifs: changing an earlier draft
+would change later states and verification, so none of these counts predicts
+end-to-end acceptance or speed. The opposite directions rule out adopting a
+global edge multiplier from this small sample; 1Cat-vLLM's selector-alignment
+study similarly separates candidate support from actual proposal/target
+overlap rather than treating an in-sample argmax sweep as a speed result.
+
+A separate English lighthouse-story prompt (same artifact, K3/B1 Graph,
+INT8 KV, 128 generated tokens) produced 55 measured rounds after its
+six-round warmup, with 72/165 accepted drafts and 32/55 first-position
+accepts. The first target argmax was in the unary top-16 on **51/55** rounds;
+**19** first-position misses had it in support and **4** did not. The target
+argmax was unary rank zero in 32 rounds, while the selector gained one
+non-rank-zero match and lost one rank-zero match. These diagnostics show the
+same broad in-support disagreement on a second prompt, not that changing the
+selector would improve acceptance; both traces read back GPU tensors and
+their elapsed times are not throughput comparisons.
+
+An HTTP request for a long story, with thinking disabled and 513 output
+tokens, used a 40-token prompt. After one warmup, the 200K/two-entitlement
+profile completed one request in 6.965 s (73.66 aggregate output tok/s) and
+two pairs in 10.327 / 10.032 s (99.35 / 102.27 aggregate output tok/s).
+The native-262K/shared-one-entitlement profile completed two pairs in
+10.666 / 10.023 s (96.20 / 102.36 aggregate output tok/s). Each response
+finished at the output limit; server throughput records reached average decode
+batch size 2.00. Prefix reuse was enabled, so these rates include possible
+cached prompt prefixes and are not controlled cold-prefill measurements.
+No 200K- or 262K-occupied concurrent prefill was run: memory admission and
+short-request batching do not establish long-context performance or completion
+at the full frontier. The startup failures do not establish the exact maximum
+feasible two-entitlement ceiling between 200K and 262K.
+
+On 2026-10-01, the same **2 × V100-SXM2 16 GB** NVLink host, CUDA 12.8, and
+branch `feat/gguf-blocks-v100` measured `out/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`
+(identity `qwen3.8-27b/gguf-blocks`, 12.0 GiB uploaded, 5.66 GiB per GPU) with
+TP2, INT8 KV, 262,144-token capacity, 4,096-token chunks, MTP3 with the
+optimized proposal head, CUDA Graph and greedy sampling. Prompts are
+`ninfer_v100_corpus --code-chat` code prompts; each point is two cold requests
+with one prefill token and 1,024 measured decode tokens and model stops
+disabled, so these are fixed-output speed measurements, not answer quality.
+
+| Occupied prompt | TTFT mean | Prefill tok/s | Decode tok/s (mean ± sd) | MTP accepted |
+|---:|---:|---:|---:|---:|
+| 30,000 | 17.90 s | 1,676 | 98.88 ± 0.00 | 80.3% |
+| 100,000 | 79.34 s | 1,260 | 76.19 ± 0.03 | 73.7% |
+| 150,000 | 144.97 s | 1,035 | 70.24 ± 0.14 | 78.1% |
+| 250,000 | 341.33 s | 734 | 57.84 ± 0.07 | 79.6% |
+
+The official NVFP4 artifact on the same build (180,224-token capacity,
+otherwise identical) measured 30K 1,054 / 115.88, 100K 873 / 82.98 and 150K
+763 / 77.14 prefill / decode tok/s.
+
+Decode progression at 30K on this branch (same prompt; tok/s; acceptance
+moves only when output tokens change):
+
+| Change | Decode | MTP accepted | Output vs previous |
+|---|---:|---:|---|
+| First version (FP32 GEMV, byte loads) | 67.20 | 77.7% | — |
+| Shared-memory weight stages, 4 rows/warp | 70.64 | 77.7% | identical |
+| int8 activations (`AllowA8`, dp4a) | 85.72 | 80.3% | differs |
+| 2 rows/warp for 2–4 columns | 88.19 | 80.3% | identical |
+| i-quant codebooks in shared memory | 89.95 | 80.3% | identical |
+| One-shot NVLink all-reduce | 98.88 | 80.3% | identical |
+
+At 30K the 1,024-token window costs about 17.3 ms per MTP round. An nsys
+trace before the all-reduce change showed ~75% of GPU time in the 4-column
+GGUF projections (190–360 GB/s against roughly 800 GB/s achievable) and ~15%
+idle in cross-device event waits; the one-shot all-reduce
+(`src/ops/common/allreduce.cu`) removed most of the latter. Prefill at 16K is
+61% CUTLASS FP16 GEMM, 16% GDN and 8% attention. Rejected variants: deeper
+weight stages (4 and 6 blocks per row) and a 32-value-per-lane sub-block
+kernel were slower end to end; MTP4/MTP5 measured 81.42 / 65.28 tok/s at 30K
+because acceptance falls to 73% / 53%.
+
+Verification: `ninfer_gguf_test` (FP64 decode of all ten formats; A16, A8 and
+tensor-core routes at real fused and TP2 shapes; GDN output permutation),
+`ninfer_allreduce_test` (both routes, 64 chained rounds), and an
+`ninfer-serve` chat completion with thinking enabled. Reproduce:
+
+```bash
+M=out/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer
+build-v100-duo/bench/ninfer_v100_corpus "$M" /tmp/code-30000.ids \
+  --code-chat 30000 --output-tokens 1024 "${sources[@]}"
+build-v100-duo/bench/ninfer_bench --weights "$M" --tp 2 --devices 0,1 \
+  --kv-dtype int8 --max-ctx 262144 --prefill-chunk 4096 --mtp-draft-tokens 3 \
+  --lm-head-draft --corpus /tmp/code-30000.ids -pg 30000,1024 --warmup 0 -r 2 \
+  -o json --output-file /tmp/gsq-30000.json
+build-v100-duo/bench/ninfer_gguf_bench   # per-format GGUF projection bandwidth
+```
+
+`sources` is the file list of the context-decay recipe above plus
+`src/ops/wrapper/{linear_swiglu,attn_input_proj,linear_add,gdn_gating_proj}.cpp`,
+`src/artifact/{storage_layouts,materializer,reader}.cpp`,
+`src/targets/qwen3_6_27b/impl/{load/bindings,variant}.cpp` and
+`src/ops/linear/ggml_k/ggml_k.cu`.
+
+## V100 Duo October 2026 rebuild: two-artifact comparison
+
+October 2, 2026: `cmake --build build-v100-duo -j` completed (381 actions) on
+2 × V100-SXM2 16 GB, CUDA 12.8. The explicit artifacts were
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer` and
+`out/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`. This is a **same-build,
+cross-artifact** comparison after the DFlash2 reader/runtime additions; no
+pre-change binary was retained for a matched old/new regression measurement.
+Do not interpret a difference from an older table as a causal effect of these
+changes. Both artifacts' Text/MTP paths run with DFlash2 residency **off**.
+The rebuilt artifact-reader test checked both artifact projections; the real
+DFlash2 K3/B1/Graph/INT8 Engine integration test passed on **each** artifact.
+
+Selected MTP3 production-server startup checks after the rebuild (CUDA Graph,
+TP2, INT8 KV, 2 × 16 GB; reported `free-after-startup` is the primary GPU):
+
+| Artifact / profile | Shared KV resolved | Primary free | Scope |
+|---|---:|---:|---|
+| NVFP4, Vision, C2, 155,648 max context, 1,024 chunk, 2,048 visual budget | 155,648 | 713 MiB | Started; not a new full-context image decode test |
+| NVFP4, text, C1, 200,000 max context, 1,024 chunk | 200,000 | 153 MiB | Near-OOM startup boundary; not a serving recommendation |
+| GSQ-RCO, Vision, C3, native 262,144 max context, 1,024 chunk, 2,048 visual budget, KV auto | 344,832 | 1.20 GiB | Started; not a three-full-context qualification |
+
+Earlier real-image and concurrent request checks are in the
+[Vision](#v100-duo-vision-and-concurrency) and
+[GSQ](#v100-duo-gsq-rco-iq3_s-gguf-blocks) sections; these three new startup
+checks do not repeat them or prove end-to-end speed for those profiles.
+
+### Matched code prompts
+
+`ninfer_v100_corpus --code-chat` rendered the same 512, 10,000 and 30,000
+token tasks with each artifact's tokenizer; the paired `.ids` files matched
+byte for byte. Each point used the public `ninfer_bench` Engine, TP2, INT8 KV,
+CUDA Graph, optimized MTP3, 131,072 max context, 4,096 prefill chunk,
+`-pg LENGTH,512 --warmup 0 -r 2`, two independent requests without prompt
+reuse and 512 measured decode outputs after the prefill token. A graph-prime
+request precedes the measured requests. Rates are the benchmark's two-rep
+arithmetic means; model load and graph preparation are excluded. The benchmark
+disables default stops and does not judge answer quality.
+
+| Model | Prompt | Prefill tok/s | Decode tok/s |
+|---|---:|---:|---:|
+| NVFP4 | 512 | 878.00 | 128.60 |
+| GSQ-RCO | 512 | 1,358.11 | 110.03 |
+| NVFP4 | 10,000 | 1,123.35 | 120.12 |
+| GSQ-RCO | 10,000 | 1,857.14 | 107.61 |
+| NVFP4 | 30,000 | 1,061.93 | 119.22 |
+| GSQ-RCO | 30,000 | 1,683.49 | 104.55 |
+
+### First SDK request capture
+
+The local-only capture harness (`tools/v100/agent_prefill/capture.mjs`) captured
+first-turn Pi, Codex and Claude Agent SDK payloads, without forwarding to a
+model service. Each artifact's tokenizer generated the same IDs for each
+captured prompt: 1,298, 11,720 and 16,368 tokens respectively. The Codex
+capture differs by two tokens from the older September capture. Run the public
+benchmark with the same 131,072-context configuration, `-pg TOKENS,8
+--warmup 0 -r 1`; the measured request has no previous prefix reuse. TTFT
+is `reps[0].timings.first_token_seconds`: first Engine output token, excluding
+load, SDK startup, network and any Agent tool actions.
+
+| Model | Agent | TTFT s | Prefill tok/s |
+|---|---|---:|---:|
+| NVFP4 | Pi | 1.248 | 1,040.13 |
+| GSQ-RCO | Pi | 0.912 | 1,423.59 |
+| NVFP4 | Codex | 10.452 | 1,121.37 |
+| GSQ-RCO | Codex | 6.213 | 1,886.42 |
+| NVFP4 | Claude | 14.759 | 1,109.08 |
+| GSQ-RCO | Claude | 8.978 | 1,823.25 |
+
+### Natural-completion MTP sweep
+
+`tools/v100/ninfer-v100-duo.sh` ran one resident server per model/window with
+`--max-context 131072 --prefill-chunk 4096 --no-thinking --no-prefix-reuse`,
+optimized proposal, Graph, TP2, INT8 KV and MTP `draft-tokens=3|4|5`.
+Each server handled three identical single-user Chat Completions requests:
+the 74-token pelican/SVG/HTML prompt in [the earlier sweep](#v100-duo-decode-pelican-html),
+`reasoning_effort:none`, `temperature:0`, `seed:42`, `max_tokens:12288`.
+All 18 responses ended with a stop token and had zero prefix-cache hits.
+The peak is the highest 5-second logged decode throughput interval with one
+running request, not a whole-request maximum. The average is the arithmetic
+mean of the three `(completion_tokens - 1) / timings_seconds.decode` rates;
+both exclude load and prefill. Different models/windows produce *different
+completions*, so this is not a fixed-output speed or quality comparison.
+
+| Model | MTP | Output tokens per run | Peak 5-second tok/s | Mean whole-request tok/s |
+|---|---:|---:|---:|---:|
+| NVFP4 | 3 | 9,668 | 148.2 | 138.058 |
+| NVFP4 | 4 | 9,324 | 156.4 | 142.871 |
+| NVFP4 | 5 | 9,881 | 176.0 | 151.448 |
+| GSQ-RCO | 3 | 6,986 | 121.0 | 109.607 |
+| GSQ-RCO | 4 | 5,887 | 110.4 | 95.164 |
+| GSQ-RCO | 5 | 6,531 | 119.6 | 93.754 |
+| Swift-1.5 | 3 | 7,995 | 153.4 | 143.128 |
+| Swift-1.5 | 4 | 8,830 | 176.2 | 157.830 |
+| Swift-1.5 | 5 | 7,778 | 183.6 | 163.134 |
+
+For NVFP4, MTP5 increases this prompt's mean but the older output inspection
+favored MTP3 for the requested pelican leg animation. GSQ favors MTP3 by
+mean; GSQ-MTP5's three full-request rates ranged 86.798–97.260 tok/s, so
+its mean is less stable than the other rows. No independent output-quality
+judgment was made for the new GSQ responses. To reproduce the server sweep,
+replace the artifact path and window `N` in the command under
+[V100 Duo decode: pelican HTML](#v100-duo-decode-pelican-html), adding
+`--max-context 131072 --prefill-chunk 4096`; use the same JSON request and
+extract `request_done` timings and five-second throughput intervals as there.
+
+The Swift-1.5 rows were measured October 5, 2026 with the same
+`build-v100-duo` binary, flags, request and three-runs-per-window protocol,
+using `/home/gareth/models/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer`
+(`kvnxiao/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-ninfer` on Hugging
+Face), a third-party OracleRouter fine-tune that loads as the same
+`qwen3.8-27b/nvfp4` target. Its nine responses all ended with a stop token
+with zero prefix-cache hits, and each window's three completions were
+identical: 7,995, 8,830 and 7,778 output tokens with per-run full-request
+rates of 143.118–143.145, 157.782–157.860 and 163.128–163.146 tok/s. It leads
+both registered artifacts in every window of this prompt, but it is a
+different model with different completion lengths and no output-quality
+inspection, so these rows remain same-prompt throughput rather than a
+quality or fixed-output comparison. Reproduce with the same command and the
+artifact path swapped.
+
+## V100 Duo Coder390 Q6_K MTP
+
+October 11, 2026: the public Engine and production server ran
+`Qwen3.8-27B-Coder390-EfficientThink-Q6_K-MTP.ninfer` from
+[nerkyor's model repository](https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-GGUF-NInfer).
+The artifact projects to `qwen3.8-27b/gguf-blocks-full`: native Q6_K text
+weights, Q8_0 embedding/output/MTP input, and a full-vocabulary proposal head.
+The server launcher needs `proposal-head=full`; direct executables omit
+`--lm-head-draft`. This campaign uses 2 × Tesla V100-SXM2 16 GB with NVLink,
+driver 580.178.04, CUDA 12.8, GCC 13.3, TP2, INT8 group-64 KV and CUDA Graph.
+The benchmark and corpus targets were rebuilt in `build-v100-duo`.
+
+These are fresh measurements of a separate fine-tune on the October 11 build.
+The older NVFP4, GSQ and Swift tables retain their original dates, prompts
+and configurations; they are historical throughput references rather than a
+matched current-build A/B or an output-quality comparison. Strict
+fresh-prefill greedy parity remains unqualified; see
+[the numerical and integration results](../tests/README.md#coder390-verification).
+
+### Single-request capacity
+
+With full-vocabulary MTP3, C1, native RoPE and the minimum supported
+128-token prefill chunk, explicit context/KV **183,360** starts with
+**69 MiB free per GPU** and completes a 128-output-token HTTP request.
+The next 64-token page, 183,424, is rejected before weights upload:
+4,388,601,600 bytes required versus 4,388,342,784 available for runtime.
+The successful profile reserves 4,387,452,672 bytes with about 0.80 MiB
+of planned slack. The observed free memory also reflects the difference
+between the planned graph allowance and graph allocations actually observed.
+This is a near-OOM capacity profile for this hardware and MTP window;
+input plus output must fit the ceiling. The 131,072-context/4,096-chunk
+C1 speed profile leaves 499 MiB free with MTP3.
+
+### Natural-completion MTP sweep
+
+The natural-completion sweep repeats the exact 74-token
+[pelican prompt](#v100-duo-decode-pelican-html) three times per resident
+MTP3/4/5 server, with C1, context/KV 131,072, chunk 4,096,
+`--no-thinking --no-prefix-reuse`, greedy temperature 0, seed 42 and
+`max_tokens:12288`. Mean decode is the arithmetic mean of
+`(completion_tokens - 1) / timings_seconds.decode`. Peak is the highest
+logged five-second decode interval with one running request. Load and
+prefill are excluded.
+
+| MTP | Output tokens per run | Peak 5-second tok/s | Mean whole-request tok/s | Draft acceptance | Startup free per GPU |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 8,314 | 111.591 | 101.744 | 87.41% | 499 MiB |
+| 4 | 5,924 | 104.994 | 91.907 | 80.67% | 499 MiB |
+| 5 | 7,367 | 110.595 | 94.806 | 75.94% | 497 MiB |
+
+All nine requests ended with a stop token, had zero prefix-cache hits and
+no reasoning content. Each window's three response texts matched, while
+different windows produced different completions. Per-request decode rates
+were 101.741–101.748, 91.896–91.917 and 94.798–94.813 tok/s respectively.
+MTP3 has the highest mean for this artifact and prompt; no independent
+output-quality judgment was made. The shared prompt does not make these
+different-length responses a fixed-output comparison.
+
+There are no completed fixed-code, SDK-first-token or occupied-context
+speed measurements in this campaign. The maximum-context result above
+qualifies startup and a short request; it does not qualify a full
+183K-occupied completion or establish long-context speed.
+
+### NVFP4 MTP3 regression check
+
+The October 11 newly compiled server also ran the official
+`$HOME/models/qwen3_8_27b_nvfp4.ninfer`, on the same two V100s and toolchain.
+It used the October 2 README recipe: optimized MTP3, TP2, INT8 KV, Graph,
+C1, context/KV 131,072, chunk 4,096, the identical 74-token pelican request,
+greedy sampling, seed 42, no thinking or prefix reuse, and three natural
+completions. No earlier binary was rebuilt for this check.
+
+| Metric | Historical reference | October 11 result |
+|---|---:|---:|
+| Mean whole-request decode | 138.058 tok/s | 138.053 tok/s |
+| Peak five-second decode | 148.2 tok/s | 148.987 tok/s |
+| Output tokens per run | 9,668 | 9,668 / 9,668 / 9,668 |
+| Accepted/drafted per run | 7,003 / 7,998 | 7,003 / 7,998 in all three runs |
+
+The mean differs by -0.0036% from the historical full-precision value;
+per-run rates were 138.051, 138.058 and 138.050 tok/s, with decode phases
+of 70.024602, 70.021507 and 70.025271 seconds. The speed reference is the
+[October 2 comparison](#v100-duo-october-2026-rebuild-two-artifact-comparison);
+the accepted/drafted reference is the earlier
+[MTP3 pelican measurement](#v100-duo-decode-pelican-html). These observations
+show no speed regression on this workload.
+
+All three requests stopped naturally with zero prefix-cache hits and no
+reasoning content; all three full response texts matched. Their output
+lengths and MTP counters agree with the recorded references. The extracted
+HTML parsed with the existing parse5 5.1.1 library without parse errors,
+contained one inline SVG with 92 shape elements and 13 SVG animations,
+including wheel rotations and two leg-path morph animations, and had no
+external `src`/`href` resources. Browser rendering was not tested. Historical
+response bodies were not retained, so these checks do not establish a
+byte-for-byte match against the October 2 output.
+
+Raw requests, responses, timings, parser diagnostics and the extracted
+`pelican.html` are under
+`profiles/bench/nvfp4_mtp3_regression_20261011/`. Reproduce with the
+pelican request protocol and this server command:
+
+```bash
+tools/v100/ninfer-v100-duo.sh model="$HOME/models/qwen3_8_27b_nvfp4.ninfer" \
+  draft-tokens=3 proposal-head=optimized \
+  --max-context 131072 --kv-capacity 131072 --prefill-chunk 4096 \
+  --max-concurrency 1 --no-thinking --no-prefix-reuse \
+  --request-log-jsonl /tmp/nvfp4-mtp3-regression.requests.jsonl
+```
+
+### Reproduction
+
+Use the artifact's explicit path and repeat the server command for
+`draft-tokens=3`, `4` and `5`, stopping the previous server before changing
+the window. After each server is ready, submit the identical
+[pelican JSON request](#v100-duo-decode-pelican-html) three times. Preserve
+the responses and `request_done`/five-second `throughput` records.
+
+```bash
+tools/v100/ninfer-v100-duo.sh \
+  model="$HOME/models/Qwen3.8-27B-Coder390-EfficientThink-Q6_K-MTP.ninfer" \
+  draft-tokens=3 proposal-head=full \
+  --max-context 131072 --kv-capacity 131072 --prefill-chunk 4096 \
+  --max-concurrency 1 --no-thinking --no-prefix-reuse \
+  --request-log-jsonl /tmp/coder390-mtp3.requests.jsonl
+```
+
+For the capacity boundary, keep MTP3, change context/KV to 183,360 and
+chunk to 128, and use one slot. Raising context/KV to 183,424 reproduces
+the reservation rejection on the idle measured host. The local raw
+server logs and responses are under
+`profiles/bench/coder390_20261011/`.
+
+## V100 Duo maximum-context capacity sweep
+
+The capacity comparison in the README varies only the requested maximum context from 1,024
+through 65,536 tokens, doubling at each step. Every request uses the same 512-token code-chat
+prompt and generates 257 tokens: one from prefill and 256 in the measured decode interval.
+It measures the effect of the capacity setting, not inference with that many occupied tokens.
+
+Each engine starts with a fresh resident model at each capacity, discards one complete warmup
+request, and measures three complete requests with prompt-cache reuse disabled. Both consume
+the exact saved prompt IDs, use greedy sampling, and retain their configured MTP3 policies.
+NInfer uses TP2, INT8 group-64 KV, CUDA Graphs and the optimized proposal head; LM Studio uses
+backend 2.33.0, automatic GPU splitting, Q8 KV and maximum-three/minimum-zero MTP as above.
+Rates exclude the first token and loading time. The tool rejects EOS/EOG, incomplete windows,
+truncated input and unexpected LM prompt-cache reuse. Reported deviations are sample standard
+deviations across three repetitions.
+
+Reproduce the prompt and comparison using the existing artifact and Python 3.11 environment:
+
+```bash
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+build-v100-duo/bench/ninfer_v100_corpus \
+  /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+  /tmp/v100-code-512.ids --code-chat 512 --output-tokens 1024 \
+  src/core/host_worker_pool.h
+
+.venv/bin/python3 tools/v100/bench_capacity.py \
+  --corpus /tmp/v100-code-512.ids --output-dir /tmp/v100-capacity
+```
+
+The runner executes the engines sequentially and stops only its own temporary LM server.
+Its output directory contains raw JSON responses, engine logs, requested and actual capacities,
+per-repetition timings, MTP counts, and `summary.json` / `summary.md`. The `--engine ninfer`
+and `--engine llama` options allow running the two sides separately in that same directory.
+
+## V100 Duo prefix cache
+
+The same two V100-SXM2 16 GB cards and GGUF-derived Qwen3.8-27B Q4_K_M artifact support
+retained-prefix reuse with TP2 and optimized MTP3. The real-model gate uses INT8 group-64 KV,
+4,096-token capacity, 256-token prefill chunks, greedy sampling and 32 output tokens. A rendered
+code prompt contains 3,274 tokens; `preserve_thinking=true` saves its complete response boundary.
+
+Three warmed cold/cache pairs measured median Engine time to first token of **11.9119 s cold**
+and **0.0173602 s cached** (686×). Model loading, prompt rendering and HTTP transport are excluded.
+Diagnostic logit/peer copies are disabled for these pairs. Cached requests report 3,274 reused
+tokens and zero computed prefill tokens. Two exact-history follow-up turns each prefill only 30
+tokens, with roughly 0.20 s time to first token. These are prompt-work savings, not a decode-rate
+increase or a cache-enabled comparison against LM Studio.
+
+The gate covers response-checkpoint replay, repeated append, zero-suffix sampling, changed-prefix
+reset, rewritten response suffixes and stopping inside an accepted MTP round before continuing.
+Repeated checkpoint execution, direct continuation versus checkpoint restore with identical
+prefill partitions, and CUDA Graph versus eager execution must agree exactly in generated tokens,
+captured logits and MTP acceptance. Both ranks' speculative egress must agree.
+
+Cold re-prefill uses a different BF16 GEMM/GDN partition from retained decode and suffix state.
+Two cold comparisons first diverged after 26 and 25 identical output tokens respectively; at each
+shared history, a fresh single-output target evaluation assigned the cached choice exactly the
+same logit as its selected winner (deficit 0). The test checks this first divergence against the
+existing TP2 0.5-logit near-tie bound; it does not claim bit-identical free-running output across
+different prefill partitions. Other cold output comparisons remain exact.
+
+Reproduce the Engine gate and the actual HTTP turn/response-checkpoint smoke with the existing
+artifact:
+
+```bash
+export LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+NINFER_V100_DUO_ARTIFACT=/Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+  build-v100-duo/tests/ninfer_qwen3_8_27b_v100-duo_prefix_real_test
+
+.venv/bin/python3 tools/smoke/serve_thinking_preservation.py \
+  --artifact /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+  --server-bin build-v100-duo/apps/ninfer-serve --backend mtp \
+  --tp 2 --devices 0,1 --kv-dtype int8
+```
+
+The HTTP smoke uses a temporary local server with a 1,024-token capacity and 128-token chunks.
+The cache remains process-local and can resume only the current frontier or its saved complete
+turn/response checkpoint; see [serving cache behavior](serving.md#execution-behavior).
+
+## Inherited RTX 5090 campaigns
+
+Tested Git revisions for the inherited campaigns:
+
+- Qwen3.8-27B NVFP4 MTP0 context-length serving:
+  `f08597d6eaafce5b875934aaa85854fcd5426df8`;
+- Qwen3.8-27B NVFP4 MTP3 single-request and concurrent fixed-corpus serving:
+  `32c9881b6783949df4999422a764b3dcaa111b13`;
+- Concurrent MTP3 decode saturation for the three measured Qwen3.6 artifact profiles:
+  `26da9df7c1b3d3c04ea7bbd730271aa01d00742a`;
+- Refreshed Qwen3.6-35B-A3B and Qwen3.6-27B NVFP4 MTP3:
+  `f4f21cc36bd1a83cbc046f668719d591dc9c1e2e`;
+- Qwen3.6-35B-A3B stored MTP3 response audit:
+  `b1a220f028aa750f75bceb3522ac00bbaab7e42d`;
+- Qwen3.6-35B-A3B DFlash block=8 (`k=7`):
+  `0dc94097e8ec5c5bcf59b9e13e9d1852f504eb61`;
+- Qwen3.6-27B NVFP4 accuracy and MTP0:
+  `b3d4d0f50b868711c62432bbd68e746217a2f49a`;
+- Qwen3.6-27B groupwise-int MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
+- Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B groupwise-int MTP0:
+  `0795169393cab0f2c16246d4bac20dee735dc2a4`.
+
+The Qwen3.6 measurements characterize its three registered artifact profiles independently on one
+NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
+decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The Qwen3.6
+concurrent decode-saturation campaign measures all three profiles at C=1, 2, 4, and 8. The
+Qwen3.8-27B NVFP4 campaign covers the MTP0 long-context profile and the complete MTP3
+speculative-decode corpus at C=1, 2, 4, and 8; its C=1 point also supplies the single-request MTP3
+results below. The registered Qwen3.8-27B `groupwise-int` profile remains outside the published
+benchmark campaign.
+
+Every inherited campaign is single-GPU except **Dual-GPU (TP2) and YaRN 1M context**, which
+is measured across two RTX 5090s and under a power limit the single-GPU campaigns were not; the two
+sets are not comparable to each other.
+
+The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
+over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
+seeds. Values are arithmetic mean ± sample standard deviation, and server warm-up completes before
+the measured requests. The concurrent campaign has its own sustained-wave method below.
+
+## Single-request serving performance method
+
+| Setting | Value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5090, 32 GiB |
+| CUDA compile/runtime | 13.1 / 13.1 |
+| CUDA driver API | 13.3 for NVFP4 and refreshed 35B MTP3; 13.1 for the remaining single-request campaigns |
+| Request mode | One active request, `stream=false` |
+| Maximum context | 262,144 tokens; 131,072 for refreshed NVFP4 MTP3 |
+| Prefill chunk | 1,024 tokens |
+| KV cache | INT8 group-64 |
+| CUDA Graph | Enabled |
+| Prefix reuse | Disabled |
+| Sampling | Temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0 |
+| Greedy profile | Exact argmax (`--sampling greedy` in the corpus runner) |
+| MTP0 | no `--spec` |
+| MTP3 | `--spec mtp --draft-tokens 3 --lm-head-draft` |
+| DFlash block=8 | `--spec dflash --draft-tokens 7 --lm-head-draft` |
+
+The MTP0 profile uses four Long NIAH prompts with approximately 8K, 64K, 128K, and 256K tokens.
+Thinking is disabled and the output budget is 128 tokens. These runs measure prefill throughput,
+server-internal time to first token, and baseline decode throughput at each context length. Content
+scenarios are not repeated with MTP disabled because they do not change the baseline decode path.
+
+The speculative-decode corpus contains three long-reasoning fixtures with thinking enabled and a
+65,536-token output limit, followed by twelve fixtures covering code, story, translation, and
+structured output. The cross-scenario fixtures disable thinking and use a 4,096-token output limit.
+The tables report actual completion lengths rather than assuming that every request reaches its
+limit.
+
+Metrics are computed from the server's unrounded phase timings and speculative-decode counters:
+
+```text
+prefill_tok_s = prompt_tokens / prefill_seconds
+server_ttft_ms = 1000 * (prepare_seconds + vision_seconds + prefill_seconds)
+decode_tok_s = (completion_tokens - 1) / decode_seconds
+spec_acceptance = accepted_tokens / drafted_tokens
+spec_tokens_per_round = 1 + accepted_tokens / speculative_rounds
+```
+
+Decode throughput is a transport/execution measurement, not a correctness score. The response text,
+finish reason, and fixture-level structural requirements are audited separately below. A request
+that exhausts its output budget or enters a repetition loop remains useful as a sustained-decode
+stress sample, but is not presented as a successfully completed task.
+
+## Qwen3.8-27B NVFP4 concurrent MTP3 corpus makespan
+
+This campaign uses the complete speculative-decode corpus described above: three long-reasoning
+fixtures and twelve cross-scenario fixtures, each with five fixed seeds, for 75 requests. The
+runner shuffles that fixed request set once with seed `20260811` and preserves the same ordered HTTP
+send sequence at every concurrency. Exactly C persistent client workers each submit their next
+request only after receiving the current response. C=1 is therefore a serial single-request corpus
+on one persistent server and supplies the per-fixture Qwen3.8 results in the final section.
+
+Each point starts a fresh server on an RTX 5090 with CUDA 13.1 compile/runtime, CUDA driver API
+13.3, stochastic sampling, INT8 group-64 KV, a 1,024-token prefill chunk, CUDA Graphs, prefix reuse
+disabled, a 131,072-token per-request context ceiling, `--kv-capacity auto`, and
+`--spec mtp --draft-tokens 3 --lm-head-draft`. Makespan begins when all client workers are released
+and ends when the final complete HTTP response has been read. Prefill and decode rates divide the
+corresponding server token totals by that full makespan; average batch includes the entire run,
+including workload transitions and drain.
+
+| C | Requests | Computed prefill tokens | Decode tokens | Makespan (s) | Requests/s | Prefill tok/s | Decode tok/s | Avg batch | MTP acceptance | Speedup vs. C1 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 75 | 15,460 | 752,160 | 4,670.27 | 0.0161 | 3.3 | 161.1 | 1.00 | 60.8% | 1.00× |
+| 2 | 75 | 15,460 | 739,951 | 2,510.78 | 0.0299 | 6.2 | 294.7 | 1.98 | 59.2% | 1.86× |
+| 4 | 75 | 15,460 | 713,384 | 1,647.74 | 0.0455 | 9.4 | 432.9 | 3.29 | 58.0% | 2.83× |
+| 8 | 75 | 15,460 | 723,602 | 2,164.90 | 0.0346 | 7.1 | 334.2 | 2.36 | 57.6% | 2.16× |
+
+All 300 requests completed without a request, CUDA, or out-of-memory failure. C=4 gives the
+shortest complete-corpus makespan. C=8 is limited by memory pressure, which constrains effective
+batching and makes the end-to-end result slower than C=4. Sampling is stochastic: prompts, seeds,
+and send order are fixed, but concurrency-specific numerical routes can change sampled
+continuations and their lengths. The makespan speedup is therefore a fixed-workload serving result
+rather than a fixed-token normalization; the exact decode-token totals are retained in the table.
+
+## Concurrent MTP3 decode saturation
+
+The concurrent campaign uses the `long_decode_aime26_15` fixture with thinking enabled. The
+rendered prompt is 293 tokens, and every request has an 8,192-token output budget. For each
+concurrency C, the runner starts a fresh `ninfer-serve` process with `max_concurrency=C`, releases
+C non-stream requests together using distinct fixed seeds, and waits for every HTTP response.
+Startup and server warmup occur before the measured wave.
+
+All points use an RTX 5090, CUDA 13.1 compile/runtime, CUDA driver API 13.3, stochastic sampling
+(temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0), INT8 group-64 KV, a 1,024-token
+prefill chunk, CUDA Graphs, prefix reuse disabled, and
+`--spec mtp --draft-tokens 3 --lm-head-draft`. Each request has a 16,384-token context ceiling.
+`--kv-capacity auto` resolved to exactly `C * 16,384` tokens at every point.
+
+Saturated throughput uses only complete one-second server intervals satisfying all of the following:
+
+- computed prefill tokens are zero;
+- `running=C`, `prefilling=0`, and `decode_ready=C`;
+- at least one decode round completed;
+- every decode round had exactly C rows.
+
+Ramp-up, prefill, and drain intervals are excluded. The reported aggregate rate is:
+
+```text
+steady_decode_tok_s = sum(committed_decode_tokens) / sum(interval_seconds)
+```
+
+Wave makespan starts when the client threads are released and ends after the last complete HTTP
+response. MTP acceptance is aggregated over the complete wave. Each row below is one sustained
+wave rather than a repeated-sample mean.
+
+| Model profile | C | Steady (s) | Avg batch | Aggregate decode tok/s | MTP acceptance | Speedup vs. C1 | Wave makespan (s) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.6-27B `groupwise-int` | 1 | 43.01 | 1.00 | 185.8 | 68.2% | 1.00× | 44.23 |
+| Qwen3.6-27B `groupwise-int` | 2 | 65.01 | 2.00 | 247.0 | 69.0% | 1.33× | 66.67 |
+| Qwen3.6-27B `groupwise-int` | 4 | 102.02 | 4.00 | 309.5 | 68.4% | 1.67× | 107.49 |
+| Qwen3.6-27B `groupwise-int` | 8 | 118.02 | 8.00 | 535.0 | 68.3% | 2.88× | 125.20 |
+| Qwen3.6-27B `nvfp4` | 1 | 39.01 | 1.00 | 202.4 | 69.3% | 1.00× | 40.46 |
+| Qwen3.6-27B `nvfp4` | 2 | 39.01 | 2.00 | 399.7 | 71.4% | 1.97× | 41.82 |
+| Qwen3.6-27B `nvfp4` | 4 | 44.01 | 4.00 | 699.7 | 69.3% | 3.46× | 47.92 |
+| Qwen3.6-27B `nvfp4` | 8 | 55.01 | 8.00 | 1,146.9 | 68.6% | 5.67× | 58.57 |
+| Qwen3.6-35B-A3B `groupwise-int` | 1 | 12.00 | 1.00 | 593.0 | 67.2% | 1.00× | 13.75 |
+| Qwen3.6-35B-A3B `groupwise-int` | 2 | 17.00 | 2.00 | 877.7 | 68.2% | 1.48× | 18.87 |
+| Qwen3.6-35B-A3B `groupwise-int` | 4 | 26.01 | 4.00 | 1,166.0 | 69.8% | 1.97× | 28.43 |
+| Qwen3.6-35B-A3B `groupwise-int` | 8 | 48.01 | 8.00 | 1,313.8 | 67.3% | 2.22× | 50.20 |
+
+All 45 requests reached their output limit, producing 368,640 completion tokens. The campaign
+contained 608 complete full-batch steady intervals and had no request, CUDA, or out-of-memory
+failure. At C=8, available device memory after startup was 2.66 GiB for 27B groupwise-int,
+2.18 GiB for 27B NVFP4, and 4.38 GiB for 35B-A3B.
+
+## Dual-GPU (TP2) and YaRN 1M context
+
+This inherited campaign was measured on the Qwen3.8-27B
+NVFP4 artifact across two RTX 5090s with `--tp 2 --devices 0,1`, INT8 group-64 KV, CUDA Graphs
+enabled, and greedy decoding. The extended-context rows additionally use
+`--rope yarn --yarn-factor 4.0 --yarn-origin 262144`.
+
+**Power condition.** The campaign was measured with both GPUs held at a **400 W per-GPU cap** --
+the minimum settable limit on these cards; the vendor defaults on the measurement host are 600 W
+and 575 W, and the maximum is 600 W on both. Sampled draw sat at 346-353 W against the cap, so the
+limit was binding. The publishable subset was then **re-measured with both cards at 575 W**, and
+the tables below carry both conditions. Lifting the cap helps `--tp 1` considerably more than
+`--tp 2`: one card running the whole model saturates its limit (peak sampled draw 575.5 W) while
+two cards sharing it peak at 391 and 406 W, so the TP2-over-TP1 decode advantage narrows from
+1.44x to 1.40x. Never quote a figure from this section without its power condition. The single-GPU
+campaigns above were measured under neither condition and are not comparable to these rows.
+
+### Method
+
+| Setting | Value |
+|---|---|
+| GPUs | 2 x NVIDIA GeForce RTX 5090, 32 GiB, no NVLink, peer-to-peer unavailable |
+| Power limit | 400 W per GPU (campaign) and 575 W per GPU (re-measurement); vendor defaults 600 W / 575 W, maximum 600 W on both cards |
+| Artifact | Qwen3.8-27B NVFP4 |
+| Tensor parallel | `--tp 2 --devices 0,1` |
+| KV cache | INT8 group-64 |
+| CUDA Graph | Enabled |
+| Prefill chunk | 1,024 tokens |
+| Sampling | Greedy (exact argmax) unless a row states otherwise |
+| Rope | `native` at 262k; `yarn` factor 4.0, origin 262,144 above it |
+| MTP3 | `--spec mtp --draft-tokens 3 --lm-head-draft` |
+
+### Single request, matched 249,955-token prompt
+
+Byte-identical prompt on both widths, 512 generated tokens. TP1 ran at `--max-context 252928`,
+the largest window that fits one card after weights; TP2 ran at the full `262144`.
+
+| Metric | TP1 @400 W | TP2 @400 W | TP2/TP1 | TP1 @575 W | TP2 @575 W | TP2/TP1 |
+|---|---:|---:|---:|---:|---:|---:|
+| Prefill tok/s | 2,269.8 | 2,680.1 | 1.18x | 2,484.2 | 2,787.0 | 1.12x |
+| Decode tok/s, MTP off | 52.35 | 75.18 | 1.44x | 53.95 | 75.32 | 1.40x |
+| Decode tok/s, MTP3 | 101.7 | 152.1 | 1.50x | 113.60 | 159.39 | 1.40x |
+| MTP3 draft acceptance | 50.83% | 57.96% | 1.14x | 50.83% | 57.96% | 1.14x |
+| Time to first token, s | 111.0 | 93.7 | 0.84x | 101.0 | 90.0 | 0.89x |
+| Per-GPU resident memory | 27.90 GiB (one card) | 15.04 GiB (each card) | | 27.90 GiB | 15.04 GiB | |
+| Peak sampled draw, MTP off | — | — | | 575.5 W | 390.9 / 405.7 W | |
+| Peak sampled draw, MTP3 | — | — | | 575.8 W | 483.8 / 444.5 W | |
+
+Draft acceptance is identical to four decimal places across the two power conditions (0.5083 and
+0.5796), which is the expected result: power changes timing, not arithmetic.
+
+On a 536-token reasoning prompt the same comparison is 152.0 to 189.5 decode tok/s and 56.61% to
+58.06% acceptance. TP1 wins short-prompt prefill (7,582 versus 5,451 tok/s at 8,147 tokens), where
+the cross-device collectives are not amortized by a long chunked prefill. **Both of these
+short-prompt comparisons were measured at the 400 W per-GPU cap only** and were not re-measured at
+575 W, so they must not be read against the 575 W rows above.
+
+### Saturated concurrent decode at a 262,144-token window
+
+One server per concurrency point, `--decode-tokens 8192`, stochastic sampling, aggregate committed
+decode tok/s over complete full-batch intervals.
+
+| Concurrency | MTP off @400 W | Speedup | MTP3 @400 W | Speedup | MTP off @575 W | MTP3 @575 W |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 93.5 | 1.00x | 172.4 | 1.00x | 94.1 | 177.8 |
+| 2 | 183.0 | 1.96x | 287.0 | 1.67x | not re-measured | not re-measured |
+| 4 | 314.3 | 3.36x | 466.0 | 2.70x | 320.3 (3.40x) | 475.2 (2.67x) |
+
+MTP raises absolute throughput at every point while scaling less steeply from batching, which is
+consistent with its single-lane throughput already sitting closer to the ceiling batching pushes
+toward. Engine-accounted per-GPU memory at C=4 was 14.97 GiB (MTP off) and 15.64 GiB (MTP3).
+
+### Extended context, single request
+
+Served from one `ninfer-serve` process at `--max-context 1048576 --max-concurrency 1`. Prefill and
+decode are the server's own phase timings.
+
+| Prompt tokens | MTP | Power | Prefill tok/s | Prefill wall | Decode tok/s |
+|---:|---|---|---:|---:|---:|
+| 8,146 | off | 400 W | 5,517.5 | 1.5 s | 97.89 |
+| 652,954-652,955 | off | 400 W | 1,348.4 | 484.2 s | 58.22 |
+| 652,954-652,955 | off | 400 W (re-run) | 1,379.5 | 470.7-476.0 s | 58.69 |
+| 1,045,954-1,045,955 | off | 400 W | 928.9 | 1,126.0 s (18.8 min) | 46.39 |
+| 1,045,954-1,045,955 | off | 575 W | 975.1 | 1,072.6 s (17.9 min) | 48.08 |
+| 1,045,954 | off, 512 generated | 575 W | 971.4 | 1,076.7 s | 46.11 |
+| 1,045,954 | MTP3, 512 generated | 575 W | 975.0 | 1,072.7 s | 100.54 at 56.41% acceptance |
+| 949,885 | off | 400 W | 1,011.89 | 938.7 s | 45.49 |
+| 949,885 | MTP3 | 400 W | 1,010.19 | — | 99.51 at 58.65% acceptance |
+
+The two 512-generated-token rows are a **like-for-like** MTP measurement: same prompt, same window,
+same token budget, so their ratio -- **2.18x** -- needs none of the cross-window caveat the
+949,885-token pair in the same table carries. The 24-token rows are needle requests, whose decode
+average starts and ends at a lower position. The 400 W and "400 W (re-run)" rows at 652,954 tokens
+are two measurements of the same configuration under the same power condition, taken three days
+apart; the 653k tier was not re-measured at 575 W.
+
+Ten 653k requests spread 0.3% in prefill rate and ten 1M requests spread 1.4% over a 4.5-hour run:
+no thermal fade and no drift. Decode degrades smoothly with context rather than falling off a
+cliff, but the decode split policy was tuned at 262k and has not been swept at 1M.
+
+At ~950k tokens MTP3 reaches 99.51 tok/s at 58.65% acceptance on non-repeating greedy text
+(400 W). That comparison against 45.49 tok/s was cross-window -- its denominator averaged a decode
+from ~950k to the 1,048,576 ceiling while its numerator decoded only ~950k to ~962k -- and it was
+quoted as "about 2.2x" for that reason. The like-for-like pair in the table above settles it:
+**100.54 against 46.11 tok/s = 2.18x**, same prompt, same window, same 512-token budget, at 575 W.
+Acceptance is flat across context: 57.96% at 250k, 58.65% at ~950k, 56.41% at 1,046k.
+
+Two figures from the same run are reported separately and must not be quoted as the headline: a
+repetitive greedy stream reaches 93.54% acceptance and 135.78 tok/s, and a
+temperature-0.8 sampled stream 80.36% and 122.21 tok/s. Sampled and greedy acceptance are different
+algorithms, and the repetitive figure is a loop artifact. Two different degeneration mechanisms
+produce those loops: the MTP-off soak stream repeats whole turns because `--ignore-eos` suppresses
+its end-of-turn token, while the MTP3 greedy stream contains no end-of-turn token at all and
+collapses into a 187-token content-level loop whose first repeat begins at generated index 1,201.
+(The 1,341-token acceptance row above is a suffix-period cut, `12,000 - 57 x 187`, not the loop
+onset; about 140 of its tokens sit inside the loop's first block, so 58.65% is a mild upper bound
+on the novel-text figure.) Sampled decoding at temperature 0.8 does not loop.
+
+### Memory, per GPU
+
+`Resident` is `nvidia-smi` per-process memory. It was flat across every sample of every run: a 1M
+prefill adds nothing to the residency chosen at load, and the workspace peaked at 112.29 MiB inside
+a 182.81 MiB reservation during a 949,863-token prefill.
+
+| Context | MTP | Weights | Sequence | Workspace | Reserved | Resident |
+|---:|---|---:|---:|---:|---:|---:|
+| 262,144 | off | 10.08 GiB | 4.28 GiB | 0.18 GiB | — | 15.04 GiB |
+| 262,144 | MTP3 | 10.46 GiB | 4.54 GiB | 0.19 GiB | — | 15.69 GiB |
+| 1,048,576 | off | 10.08 GiB | 16.66 GiB | 182.81 MiB | 26.93 GiB | 27.41 GiB |
+| 1,048,576 | MTP3 | 10.46 GiB | 17.69 GiB | 192.93 MiB | 28.42 GiB | 28.84 GiB |
+
+`Reserved` is the CLI load summary's per-device row; the 262,144-token rows were measured through
+`ninfer-serve`'s startup record and `nvidia-smi` instead. The gap of about 0.48 GiB between
+`Reserved` and `Resident` is the CUDA context and driver-side allocations the planner does not
+count, so the summary's `planned slack` over-reports free memory by that much. CUDA Graph residency
+at 1M was 2.00-3.00 MiB per device against a 20.00 MiB allowance.
+
+Turning MTP3 on costs a measured 1.49 GiB of reserved memory per device at 1,048,576 tokens and
+0.65 GiB at 262,144. Its two dominant terms are 0.38 GiB of head weights, fixed at any window, and
+1.03 GiB of MTP KV per 1M tokens of window; the remainder of each measured delta is workspace and
+sequence-arena rounding. At 1M with MTP3 the margin to a 30 GiB per-device budget is 1.16 GiB.
+
+### Reproduction
+
+The dual-GPU campaign is driven by the same concurrency runner as the single-GPU tables, with the
+tensor-parallel flags added:
+
+```bash
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
+  --mode mtp3 --suite decode-saturation --concurrency 1 --concurrency 2 --concurrency 4 \
+  --tp 2 --devices 0,1 --device 0 \
+  --max-context 262144 --kv-capacity 262144 \
+  --output profiles/bench/tp2_decode_saturation
+```
+
+The extended-context rows are single requests against a server started with the 1M configuration:
+
+```bash
+./build/apps/ninfer-serve out/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --rope yarn --yarn-factor 4.0 --yarn-origin 262144 \
+  --max-context 1048576 --kv-capacity auto --kv-dtype int8 \
+  --max-concurrency 1 --prefill-chunk 1024 \
+  --request-log-jsonl run.requests.jsonl
+```
+
+Read prefill and decode from that log's `request_done.timings_seconds`, and confirm the power
+condition with `nvidia-smi --query-gpu=power.limit,power.default_limit,power.draw --format=csv`
+before quoting any figure.
+
+### Cross-engine comparison against vLLM (NVFP4, 500 W per GPU)
+
+This comparison is a **third power condition**: both cards capped at **500 W per GPU**, distinct
+from the 400 W campaign and the 575 W re-measurement above. Rows from the three conditions are not
+comparable with each other.
+
+One request at a time, byte-identical needle-in-a-haystack prompts at three context tiers, 512
+output tokens, temperature 0, thinking off, and a freshly booted server per tier on both sides so
+that every prefill is genuinely cold -- zero prefix-cache hits, verified from each engine's own
+counters. `Prefill tok/s` is `prompt_tokens / TTFT`; `decode tok/s` is measured client-side over
+the streamed window. `Peak VRAM/GPU` is the peak the engine's own process held on each device, and
+peak draw comes from a 3 s sampler. Every row below was taken at the 500 W per-GPU cap.
+
+| Engine | Window served | Tier | MTP | Prompt tokens | TTFT (s) | Prefill tok/s | Decode tok/s | Total (s) | Peak VRAM/GPU | Peak draw (GPU0 / GPU1) |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|---|
+| vLLM 0.25.1 | 750,000 | 250k | MTP3 | 249,955 | 79.14 | **3,158.5** | 110.78 | 83.75 | 28.90 GiB | 443.9 / 467.6 W |
+| vLLM 0.25.1 | 750,000 | 653k | MTP3 | 652,955 | 353.84 | **1,845.3** | 41.94 | 366.03 | 29.00 GiB | 473.6 / 496.4 W |
+| vLLM 0.25.1 | 750,000 | 700k | MTP3 | 699,955 | 402.56 | **1,738.8** | 41.01 | 415.02 | 28.90 GiB | 475.3 / 497.7 W |
+| NInfer TP2 | 1,048,576 | 250k | off | 249,955 | 92.56 | 2,700.5 | 73.35 | 99.51 | 27.41 GiB | 385.2 / 396.8 W |
+| NInfer TP2 | 1,048,576 | 250k | MTP3 | 249,955 | 91.66 | 2,726.9 | **155.80** | 94.93 | 28.84 GiB | 380.9 / 373.6 W |
+| NInfer TP2 | 1,048,576 | 653k | off | 652,955 | 465.82 | 1,401.7 | 56.70 | 474.81 | 27.41 GiB | 414.1 / 440.0 W |
+| NInfer TP2 | 1,048,576 | 653k | MTP3 | 652,955 | 471.01 | 1,386.3 | **118.74** | 475.28 | 28.84 GiB | 475.3 / 488.1 W |
+| NInfer TP2 | 1,048,576 | 700k | off | 699,955 | 529.26 | 1,322.5 | 54.84 | 538.55 | 27.41 GiB | 415.2 / 458.8 W |
+| NInfer TP2 | 1,048,576 | 700k | MTP3 | 699,955 | 532.42 | 1,314.7 | **103.42** | 537.33 | 28.84 GiB | 465.0 / 463.0 W |
+
+vLLM 0.25.1 served `unsloth/Qwen3.8-27B-NVFP4` at `--tensor-parallel-size 2` with FP8 KV, YaRN x4
+injected through `--hf-overrides`, `--max-model-len 750000`, `--max-num-batched-tokens 16768`,
+FlashInfer, and `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. Its
+speculative configuration is fixed at launch, so all three of its rows are MTP3. NInfer served its
+own NVFP4 artifact at `--tp 2 --rope yarn --yarn-factor 4.0 --yarn-origin 262144
+--max-context 1048576 --kv-dtype int8 --prefill-chunk 1024`.
+
+The two engines counted **identical prompt token totals at every tier** -- 249,955 / 652,955 /
+699,955, each server tokenizing the same prompt string independently. That is the evidence that
+they were given the same input.
+
+**Prefill goes to vLLM at every tier**, by 1.17x at 250k, 1.32x at 653k and 1.32x at 700k:
+3,158.5 / 1,845.3 / 1,738.8 tok/s against NInfer's 2,700.5 / 1,401.7 / 1,322.5. The most likely
+single cause is prefill chunking -- vLLM batches up to 16,768 tokens per prefill step, NInfer
+1,024 -- and that is a tunable rather than a ceiling. It was not swept.
+
+**Decode goes to NInfer, and the cause is vLLM's speculative acceptance past its native window.**
+That deployment's native window is 262,144 tokens; beyond it, its MTP head still drafts 3 tokens
+per step and has every one rejected. Acceptance measured from each engine's own counters, for
+exactly the requests in the table:
+
+| Tier | vLLM drafted / accepted | vLLM acceptance | NInfer drafted / accepted | NInfer acceptance |
+|---|---:|---:|---:|---:|
+| 250k | 606 / 311 | 51.3% | 567 / 322 | 56.8% |
+| 653k | 1,533 / **0** | **0.0%** | 547 / 328 | 60.0% |
+| 700k | 1,533 / **0** | **0.0%** | 602 / 310 | 51.5% |
+
+So vLLM pays the drafter's cost for nothing at 653k and 700k, and its decode falls to 41.94 and
+41.01 tok/s. NInfer's acceptance is flat across the same range, and its MTP3 decode is **2.83x and
+2.52x** vLLM's there (118.74 and 103.42 tok/s). NInfer's MTP-*off* decode at those tiers (56.70 and
+54.84 tok/s) already beats vLLM's speculative decode. At 250k, where vLLM's speculation still
+works, vLLM decodes 110.78 tok/s against NInfer's 155.80 with MTP3 and 73.35 with MTP off.
+
+**Context ceiling and memory.** vLLM's KV pool measured 759,297 tokens at boot (12.73 GiB, FP8,
+`--gpu-memory-utilization 0.85`), with 28.90-29.00 GiB held per GPU. NInfer holds 1,048,576 tokens
+-- 38% more window -- in 27.41 GiB per GPU with MTP off and 28.84 GiB with MTP3. The 700k tier sits
+near vLLM's ceiling and comfortably inside NInfer's. A second boot of the same vLLM configuration
+measured 760,847 tokens; the pool varies by about 0.2% between boots with the free-memory profile
+at launch.
+
+**End to end at 512 output tokens, vLLM finishes first at every tier**, because a request of that
+shape is almost entirely prefill. NInfer's decode advantage repays its slower prefill beyond
+roughly **4,800 output tokens at 250k, 7,600 at 653k and 8,800 at 700k** (NInfer MTP3 against
+vLLM). The Qwen3.8 card's own guidance for a 1M window -- up to 262k tokens of reasoning and 131k
+of final response on agentic tasks -- sits far above all three break-even points.
+
+#### Caveats on the cross-engine rows
+
+- **Different weights.** vLLM served `unsloth/Qwen3.8-27B-NVFP4`, an NVFP4 quantization of the base
+  Qwen3.8-27B fine-tune; NInfer served its own conversion of the huihui abliterated fine-tune.
+  These are different quantizations of different fine-tunes. The comparison is *engine plus
+  quantization pipeline*, not a controlled same-weights benchmark. Architecture, layer count and
+  hidden sizes are identical, so the prefill and decode arithmetic has the same shape, but nothing
+  here isolates the engine from the checkpoint.
+- **Different KV dtypes.** vLLM FP8, NInfer INT8. That affects both the memory rows and attention
+  bandwidth, so it is present in both the prefill and the decode columns.
+- **Different prefill chunking, unswept.** vLLM `--max-num-batched-tokens 16768` against NInfer
+  `--prefill-chunk 1024`, the value the 1M configuration ships with. Neither was swept.
+- **No vLLM MTP-off row.** Speculative decoding is fixed at launch and turning it off needs a
+  restart with a different `--speculative-config`; that run was not made. vLLM's 653k and 700k rows
+  are therefore MTP-off *behaviour* at MTP-on *cost*, which is worse than a true MTP-off run would
+  be.
+- **No quality claim.** Both engines ran at `temperature 0`, `seed 42`, 512 max tokens, but their
+  rejection-sampling paths under speculative decoding are not guaranteed identical and no
+  token-level equivalence was checked. This is a throughput comparison only.
+- **n = 1 per cell.** Each row is a single request.
+- **The 500 W NInfer 250k rows are not a like-for-like re-run of the 575 W 250k rows.** These ran
+  YaRN at a 1,048,576-token window, to match vLLM's YaRN deployment; the 575 W rows ran native rope
+  at 262,144. The roughly 2% difference between them combines the lower cap with the window change
+  and does not separate the two.
+- **The vLLM client needed a wrapper.** That server runs `--reasoning-parser qwen3`, which routes
+  output to `delta.reasoning_content`, and it ignores a top-level `enable_thinking` field (its
+  equivalent is `chat_template_kwargs`). The project probe reads `delta.content` and sends the
+  top-level field, so the vLLM rows were taken with a wrapper client that times the first delta on
+  either channel and sends `chat_template_kwargs={"enable_thinking": false}`. Every vLLM row
+  reports its tokens arriving on the `content` channel, so thinking was off on both sides.
+
+Two further points about vLLM's extended context, independent of the table:
+
+- **Extended context in vLLM is a checkpoint property, not a serving flag.** An NVFP4 repackaging
+  that ships without a YaRN block in `config.json` `rope_parameters` is capped at its
+  `max_position_embeddings` (262,144) until one is injected at load. `--hf-overrides` does exactly
+  that, and vLLM then serves this checkpoint far beyond 262,144 tokens. The difference from NInfer
+  is **where the configuration lives** -- a serving flag on an unmodified artifact here, a
+  checkpoint-config override there -- not a capability difference.
+- **A prefix-cache measurement, not a comparison row.** One extra vLLM run replayed the identical
+  250k prompt on the same server: 248,000 of 249,955 tokens served from the prefix cache (99.22%),
+  TTFT 1.80 s instead of 79.14 s, decode unchanged at 108.75 tok/s.
+
+The raw probe records, per-request server logs, power and VRAM samples, speculative counters and
+the full methodology are committed under
+[`eval/results/cross-engine-nvfp4/`](../eval/results/cross-engine-nvfp4/README.md).
+
+### Measurement gaps in this campaign
+
+- **Concurrency C=2 was measured at the 400 W cap only**; the 575 W re-measurement covered C=1 and
+  C=4, and the 653k extended-context tier was not re-measured at 575 W.
+- **The soak is greedy only.** A seeded temperature > 0 soak, as the decode-coverage complement, has
+  not been run.
+- **The cross-engine comparison has no vLLM MTP-off row**, because speculative decoding is fixed at
+  vLLM's launch and that restart was not made, and **the prefill-chunk difference was not swept** on
+  either engine (`--prefill-chunk 1024` against `--max-num-batched-tokens 16768`).
+
+The design decisions and correctness gates behind these numbers are in
+[Dual-GPU (TP2) execution and YaRN 1M context](maintainer/tp2-yarn-1m.md).
+
+## Reproduction
+
+Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refreshed per-target
+serving tables use:
+
+```bash
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
+  --mode mtp3 --suite corpus-makespan --concurrency 1 \
+  --max-context 262144 --kv-capacity auto \
+  --output profiles/bench/concurrent_corpus_35b_mtp3_20260811
+
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --mode mtp3 \
+  --output profiles/bench/serve_corpus_27b_mtp3_20260724
+
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --mode mtp0 --sampling stochastic \
+  --output profiles/bench/serve_corpus_27b_nvfp4_w8_20260731
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --mode mtp3 --suite corpus-makespan --concurrency 1 \
+  --max-context 131072 --kv-capacity auto \
+  --output profiles/bench/concurrent_corpus_27b_nvfp4_mtp3_20260811
+
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
+  --mode mtp0 --sampling stochastic \
+  --output profiles/bench/serve_corpus_qwen3_8_27b_nvfp4_mtp0_20260817
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
+  --mode mtp3 --suite corpus-makespan \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --max-context 131072 --kv-capacity auto \
+  --output profiles/bench/concurrent_corpus_qwen3_8_27b_nvfp4_mtp3_20260817
+```
+
+The concurrent decode-saturation campaigns use:
+
+```bash
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --mode mtp3 --suite decode-saturation \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
+  --output profiles/bench/concurrent_decode_27b_mtp3_20260811
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --mode mtp3 --suite decode-saturation \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
+  --output profiles/bench/concurrent_decode_27b_nvfp4_mtp3_20260811
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
+  --mode mtp3 --suite decode-saturation \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
+  --output profiles/bench/concurrent_decode_35b_mtp3_20260811
+```
+
+Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for
+the exact-argmax profile.
+
+Omit `--mode` and supply the two measured Qwen3.6 groupwise-int artifacts to run the complete
+published Qwen3.6 MTP0/MTP3 campaign:
+
+```bash
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
+  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --output profiles/bench/serve_corpus_20260720
+```
+
+For the 27B NVFP4 accuracy run, start the model service with:
+
+```bash
+build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 18080 \
+  --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+Then run the repository's full 27B reasoning suite in a separate shell:
+
+```bash
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+  --config eval/configs/qwen3_6_27b_reasoning.yaml \
+  --suite reasoning_full
+```
+
+## `qwen3_6_35b_a3b`
+
+### MTP0 context-length profile
+
+| Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+|---:|---:|---:|---:|---:|
+| 7,680 | 5 | 15,544.3 ± 242.4 | 500.2 ± 7.8 | 271.1 ± 3.6 |
+| 64,512 | 5 | 10,809.0 ± 95.3 | 6,009.9 ± 52.6 | 242.9 ± 1.3 |
+| 130,048 | 5 | 7,828.4 ± 34.1 | 16,693.3 ± 71.2 | 219.4 ± 1.6 |
+| 260,096 | 5 | 5,157.1 ± 52.4 | 50,598.8 ± 519.7 | 188.2 ± 2.1 |
+
+### MTP3 long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 8,223.0 ± 2,224.1 | 726.2 ± 22.9 | 82.8% ± 3.4% | 3.48 ± 0.10 |
+| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 620.3 ± 8.1 | 72.7% ± 1.4% | 3.18 ± 0.04 |
+| `long_decode_aime26_30` | 5 | 52,977.8 ± 11,849.6 | 671.9 ± 8.8 | 80.1% ± 2.7% | 3.40 ± 0.08 |
+
+### MTP3 cross-scenario decode
+
+Each category contains three fixtures and five seeds per fixture, for 15 samples.
+
+| Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 657.6 ± 34.3 | 70.3% ± 5.5% | 3.11 ± 0.16 |
+| Story | 15 | 456.2 ± 36.6 | 38.0% ± 6.0% | 2.14 ± 0.18 |
+| Translation | 15 | 649.7 ± 33.0 | 67.6% ± 5.1% | 3.03 ± 0.15 |
+| Structured | 15 | 770.9 ± 29.3 | 89.1% ± 4.9% | 3.67 ± 0.15 |
+
+### DFlash block=8 (`k=7`), stochastic sampling
+
+The fixtures, five seeds, sampling parameters, and output limits are identical to MTP3. Different
+speculative backends consume random values differently, so this is a fixed-workload comparison
+rather than a token-identical paired-output comparison.
+
+#### Long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | DFlash acceptance | DFlash tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 8,495.4 ± 2,221.2 | 764.1 ± 55.6 | 65.2% ± 5.4% | 5.56 ± 0.38 |
+| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 584.0 ± 33.3 | 51.1% ± 3.7% | 4.58 ± 0.26 |
+| `long_decode_aime26_30` | 5 | 53,330.4 ± 11,198.5 | 638.3 ± 15.8 | 56.4% ± 2.5% | 4.95 ± 0.17 |
+
+#### Cross-scenario decode
+
+| Category | Samples | Decode tok/s | DFlash acceptance | DFlash tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 562.3 ± 36.2 | 43.0% ± 3.7% | 4.01 ± 0.26 |
+| Story | 15 | 261.7 ± 51.1 | 12.1% ± 5.3% | 1.85 ± 0.37 |
+| Translation | 15 | 490.8 ± 62.6 | 34.8% ± 6.3% | 3.44 ± 0.44 |
+| Structured | 15 | 786.4 ± 124.7 | 66.5% ± 13.5% | 5.66 ± 0.94 |
+
+#### Decode throughput versus MTP3
+
+| Workload | MTP3 tok/s | DFlash tok/s | DFlash change |
+|---|---:|---:|---:|
+| `long_decode_aime26_01` | 726.2 | 764.1 | +5.2% |
+| `long_decode_aime26_15` | 620.3 | 584.0 | -5.9% |
+| `long_decode_aime26_30` | 671.9 | 638.3 | -5.0% |
+| Code | 657.6 | 562.3 | -14.5% |
+| Story | 456.2 | 261.7 | -42.6% |
+| Translation | 649.7 | 490.8 | -24.5% |
+| Structured | 770.9 | 786.4 | +2.0% |
+
+### DFlash block=8 (`k=7`), greedy sampling
+
+Greedy uses exact argmax; all other corpus and server settings remain unchanged. The five seeds
+repeat the same deterministic generation path, so within-fixture standard deviation measures
+runtime variation rather than output variation.
+
+#### Long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | DFlash acceptance | DFlash tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 6,692.0 ± 0.0 | 872.4 ± 3.3 | 74.4% ± 0.0% | 6.21 ± 0.00 |
+| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 651.6 ± 0.6 | 58.6% ± 0.0% | 5.10 ± 0.00 |
+| `long_decode_aime26_30` | 5 | 65,536.0 ± 0.0 | 994.9 ± 3.4 † | 98.0% ± 0.0% | 7.86 ± 0.00 |
+
+† The generation is a deterministic repetition loop, not a valid AIME response. The raw rate is
+retained to describe what was measured, but is excluded from performance comparisons.
+
+#### Cross-scenario decode
+
+| Category | Samples | Decode tok/s | DFlash acceptance | DFlash tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 599.8 ± 12.3 | 46.4% ± 1.4% | 4.25 ± 0.10 |
+| Story | 15 | 291.5 ± 55.6 | 14.9% ± 5.7% | 2.04 ± 0.40 |
+| Translation | 15 | 475.5 ± 50.6 | 33.0% ± 5.1% | 3.31 ± 0.36 |
+| Structured | 15 | 869.0 ± 120.2 | 74.5% ± 13.1% | 6.21 ± 0.92 |
+
+#### Decode throughput versus stochastic DFlash
+
+| Workload | Stochastic tok/s | Greedy tok/s | Greedy change |
+|---|---:|---:|---:|
+| `long_decode_aime26_01` | 764.1 | 872.4 | +14.2% |
+| `long_decode_aime26_15` | 584.0 | 651.6 | +11.6% |
+| `long_decode_aime26_30` | 638.3 | 994.9 † | not comparable † |
+| Code | 562.3 | 599.8 | +6.7% |
+| Story | 261.7 | 291.5 | +11.4% |
+| Translation | 490.8 | 475.5 | -3.1% |
+| Structured | 786.4 | 869.0 | +10.5% |
+
+### Speculative-decode output audit
+
+The audit covers all 225 stored July responses from the 35B-A3B MTP3 stochastic-sampler, DFlash
+stochastic-sampler, and DFlash greedy campaigns. It checks termination, exact repetition, and
+fixture-specific mechanical constraints. AIME 1 was checked algebraically; the AIME 30 answer
+(`393`) was checked by independent enumeration. This audit does not attempt to assign a subjective
+quality score to prose or translations.
+
+#### Long-reasoning answers
+
+| Fixture | MTP3 stochastic sampler | DFlash stochastic sampler | DFlash greedy |
+|---|---|---|---|
+| `long_decode_aime26_01` | 5/5 correct, natural stop | 5/5 correct, natural stop | 5/5 correct, natural stop |
+| `long_decode_aime26_15` | 0/5 answers; all reach 65,536-token limit | 0/5 answers; all reach 65,536-token limit | 0/5 answers; all reach 65,536-token limit |
+| `long_decode_aime26_30` | 3/5 correct, 1 wrong, 1 no answer | 2/5 correct, 1 wrong, 2 no answer | 0/5 answers; all enter the same repetition loop |
+
+The greedy AIME 30 response has an empty final-content field and fills its 65,536-token reasoning
+budget. The exact line `Wait, $x_7 x_1 x_3$ is $x_7 x_1 x_3$.` occurs 2,406 times among 2,538
+non-empty reasoning lines. Its 98.0% acceptance and 994.9 tok/s therefore characterize a highly
+predictable pathological loop, not normal reasoning performance.
+
+AIME 15 is also not a valid completion in any of the three campaigns: every sample exhausts the
+budget without a boxed answer. Its output is long, non-convergent reasoning rather than the short
+exact cycle seen in greedy AIME 30. The AIME 15 rates may be read only as sustained long-decode
+throughput.
+
+#### Cross-scenario outputs
+
+| Category | MTP3 stochastic sampler | DFlash stochastic sampler | DFlash greedy |
+|---|---|---|---|
+| Code | 1/15 natural stops; 0/15 prompt-complete | 2/15 natural stops; 0/15 prompt-complete | 0/15 natural stops |
+| Story | 9/15 natural stops; the nine Chinese outputs pass requested division and minimum length | 8/15 natural stops; the eight Chinese outputs pass requested division and minimum length | 10/15 natural stops; five Chinese dialogue outputs are under length |
+| Translation | 15/15 natural stops; 15/15 pass structural checks | 15/15 natural stops; 15/15 pass structural checks | 15/15 natural stops; 15/15 pass structural checks |
+| Structured | 0/15 satisfy the requested complete record/script contract | 0/15 satisfy the requested complete record/script contract | 0/15 satisfy the requested complete record/script contract |
+
+The code prompts require complete runnable multi-file deliverables, but almost all outputs end at the
+4,096-token limit. The three natural-stop exceptions also contain decisive contract failures: the
+MTP3 CUDA response substitutes CUDA 12.8 and an older architecture list; the DFlash CUDA response
+copies FP32 input into a half-sized 16-bit allocation and passes raw `unsigned short` values to BF16
+intrinsics; and the DFlash Python response never writes its advertised JSONL event stream to the
+configured log file. Code throughput is therefore a truncated-generation stress result, not
+successful code-generation throughput.
+
+All English mystery samples reach the output limit with an unfinished ending. The naturally stopped
+Chinese stories have the requested chapter/act counts; the MTP3 and stochastic-DFlash samples also
+meet their requested Chinese-character minima. Greedy's five dialogue stories contain 3,239 Chinese
+characters each, below the requested 3,500. Story results are consequently a mixed normal/truncated
+workload.
+
+All translation outputs stop naturally. Each plain-document result preserves six sections and
+provides at least twenty glossary entries; each Markdown result preserves heading levels, the
+six-line table, all required inline identifiers, and the exact fenced JSON object. Translation is
+the cleanest cross-scenario normal-completion comparison in this corpus.
+
+The structured prompts intentionally exceed what these generations fit into 4,096 tokens. MTP3,
+stochastic DFlash, and greedy DFlash produce only 49–60, 49–58, and 57 valid JSONL records,
+respectively, versus the requested 160. Their complete-width CSV ranges are 122–139, 121–143, and
+133 rows versus the requested 220. No SQL output satisfies all four tables, two views, at least 80
+rows, and six final analytical queries. These high-acceptance results describe predictable partial
+record generation only.
+
+The exact-line and repeated-token scan found no other response with a short-cycle collapse comparable
+to greedy AIME 30. Output-limit and prompt-compliance failures above remain material even when no
+repetition loop is present.
+
+## `qwen3_6_27b`
+
+### EvalScope reasoning accuracy
+
+Both weight profiles were evaluated through NInfer's OpenAI-compatible serving route with thinking
+enabled, MTP=3, and a 262,144-token context limit. EvalScope 1.9.0 used 0-shot prompts, rule-based
+scoring, and one sample per problem with temperature 0.6, top-p 0.95, top-k 20, presence penalty
+1.0, and seed 42. All 258 samples completed and were scored for each profile.
+
+| Weights ID | AIME 2025 | AIME 2026 | GPQA-Diamond |
+|---|---:|---:|---:|
+| `groupwise-int` | 86.67% (26 / 30) | 93.33% (28 / 30) | 86.87% (172 / 198) |
+| `nvfp4` | 93.33% (28 / 30) | 93.33% (28 / 30) | 84.34% (167 / 198) |
+
+These are single-sample results under the stated evaluation profile, not pass@k scores. Each
+benchmark remains independently reportable; no combined score is computed.
+
+### `groupwise-int`
+
+#### MTP0 context-length profile
+
+| Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+|---:|---:|---:|---:|---:|
+| 7,680 | 5 | 3,218.1 ± 4.3 | 2,392.4 ± 3.0 | 77.6 ± 0.1 |
+| 64,512 | 5 | 2,655.9 ± 2.9 | 24,335.7 ± 25.2 | 70.7 ± 0.1 |
+| 130,048 | 5 | 2,185.3 ± 0.3 | 59,590.3 ± 8.9 | 64.5 ± 0.1 |
+| 260,096 | 5 | 1,614.8 ± 0.6 | 161,221.8 ± 62.5 | 54.8 ± 0.1 |
+
+#### MTP3 long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 10,686.2 ± 553.8 | 175.4 ± 1.0 | 77.9% ± 0.9% | 3.34 ± 0.03 |
+| `long_decode_aime26_15` | 5 | 61,604.2 ± 5,677.9 | 161.9 ± 2.8 | 73.4% ± 1.7% | 3.20 ± 0.05 |
+| `long_decode_aime26_30` | 5 | 47,339.8 ± 9,162.2 | 172.2 ± 0.9 | 78.8% ± 0.8% | 3.36 ± 0.02 |
+
+#### MTP3 cross-scenario decode
+
+Each category contains three fixtures and five seeds per fixture, for 15 samples.
+
+| Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 167.0 ± 5.4 | 72.3% ± 3.5% | 3.17 ± 0.11 |
+| Story | 15 | 112.6 ± 9.4 | 37.8% ± 5.9% | 2.13 ± 0.18 |
+| Translation | 15 | 161.5 ± 11.3 | 68.3% ± 7.2% | 3.05 ± 0.22 |
+| Structured | 15 | 193.0 ± 18.8 | 88.7% ± 11.7% | 3.66 ± 0.35 |
+
+### `nvfp4`
+
+The fixtures, seeds, sampling parameters, output limits, and runtime options are identical to the
+groupwise-int serving campaign. Quantization can change sampled tokens, so the MTP3 results are a
+fixed-workload comparison rather than a token-identical output comparison.
+
+#### MTP0 context-length profile
+
+| Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+|---:|---:|---:|---:|---:|
+| 7,680 | 5 | 11,191.5 ± 70.2 | 692.5 ± 4.3 | 86.4 ± 0.5 |
+| 64,512 | 5 | 6,298.5 ± 97.6 | 10,288.6 ± 159.3 | 78.0 ± 1.2 |
+| 130,048 | 5 | 4,204.7 ± 14.1 | 31,012.5 ± 104.6 | 71.2 ± 0.2 |
+| 260,096 | 5 | 2,510.6 ± 16.8 | 103,761.1 ± 698.8 | 59.9 ± 0.3 |
+
+#### MTP3 long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 12,053.4 ± 820.9 | 231.0 ± 3.0 | 80.2% ± 1.2% | 3.41 ± 0.04 |
+| `long_decode_aime26_15` | 5 | 63,109.0 ± 5,426.9 | 213.1 ± 4.2 | 76.3% ± 2.0% | 3.29 ± 0.06 |
+| `long_decode_aime26_30` | 5 | 57,166.4 ± 9,204.9 | 223.3 ± 1.8 | 81.1% ± 1.5% | 3.43 ± 0.04 |
+
+#### MTP3 cross-scenario decode
+
+Each category contains three fixtures and five seeds per fixture, for 15 samples.
+
+| Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 220.3 ± 8.2 | 74.2% ± 4.0% | 3.23 ± 0.12 |
+| Story | 15 | 148.8 ± 11.6 | 39.2% ± 5.7% | 2.18 ± 0.17 |
+| Translation | 15 | 213.6 ± 12.2 | 70.5% ± 6.0% | 3.12 ± 0.18 |
+| Structured | 15 | 252.2 ± 16.3 | 89.8% ± 8.0% | 3.69 ± 0.24 |
+
+The baseline and speculative-decode suites intentionally measure different supported workloads.
+No per-scenario baseline/speculative speedup is reported.
+
+## `qwen3_8_27b`
+
+### `nvfp4`
+
+The MTP0 table comes from the serial Long NIAH campaign described by the single-request method. The
+MTP3 tables come from the C=1 point of the fixed concurrent-corpus campaign, which serially runs the
+same three long-reasoning and twelve cross-scenario fixtures. Each fixture has five fixed seeds. The
+tables report arithmetic mean ± sample standard deviation from the server's per-request phase
+timings and speculative counters.
+
+#### MTP0 context-length profile
+
+| Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+|---:|---:|---:|---:|---:|
+| 7,680 | 5 | 8,340.4 ± 13.0 | 931.6 ± 1.6 | 71.2 ± 0.1 |
+| 64,512 | 5 | 5,297.9 ± 259.2 | 12,281.1 ± 561.5 | 65.7 ± 0.8 |
+| 130,048 | 5 | 3,544.7 ± 25.3 | 36,853.5 ± 259.4 | 59.6 ± 0.9 |
+| 260,096 | 5 | 2,203.1 ± 13.4 | 118,354.8 ± 717.2 | 52.9 ± 2.3 |
+
+#### MTP3 long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 1,465.4 ± 417.3 | 195.2 ± 4.6 | 76.0% ± 2.4% | 3.28 ± 0.07 |
+| `long_decode_aime26_15` | 5 | 65,414.4 ± 271.9 | 151.4 ± 2.0 | 56.2% ± 1.1% | 2.69 ± 0.03 |
+| `long_decode_aime26_30` | 5 | 50,023.4 ± 14,839.1 | 167.5 ± 23.7 | 64.6% ± 14.9% | 2.94 ± 0.45 |
+
+#### MTP3 cross-scenario decode
+
+Each category contains three fixtures and five seeds per fixture, for 15 samples.
+
+| Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 194.3 ± 6.1 | 76.4% ± 3.9% | 3.29 ± 0.12 |
+| Story | 15 | 126.1 ± 10.9 | 37.4% ± 5.8% | 2.12 ± 0.17 |
+| Translation | 15 | 192.3 ± 11.9 | 75.0% ± 6.5% | 3.25 ± 0.19 |
+| Structured | 15 | 219.8 ± 8.6 | 90.8% ± 5.1% | 3.72 ± 0.15 |
