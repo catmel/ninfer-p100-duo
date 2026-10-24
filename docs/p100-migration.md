@@ -452,7 +452,35 @@ PCIe" 能力;remote-write 与 fence 语义在 sm_60 P2P 上与 V100 路径等价
   rank0 张量指针,对称不变量 + direct-P2P qualified 支撑 rank1 读取)绑定。
 - **oracle**:15 FP64 用例 ×(bound=tokens 全列位一致 + bound=tokens/2 前段位一致/后段精确零)
   = **45 项本地全 PASS**。
-- **NAS 部署 + A/B vs 33.35**:(占位 — job pwsh-0b6f11a7c4474510,完成后回填)
+- **NAS 部署 + A/B vs 33.35**:**失败回退(2026-10-24 20:0x)**——V10a 运行时 `break` 守卫使全
+  部 vector 实例失去软件流水(prefill 61/decode 27.7);V10b `Dyn` 双实例分裂恢复 prefill 68,
+  但 decode 仍 27.94×3(vs V9 33.35,-16%);已实测的界内 MT4 窗口收益(+14%)不足以覆盖未解释
+  回退,MTP-forward 侧(T=8 窗口)绑定变体未及部署即被 bisect 阻塞。**决策:V10 不发布,
+  工作树整体回滚到 V9 验证态;实验代码存档 NAS `/vol1/1000/backups/v10-experiment-20261024/`
+  供后续重新立项**。探针数据保留(§7.x 上文 610/527/1134/270/313µs 矩阵即来自该实验)。
+
+## 7.y 开源交付与 V9 回滚验证(2026-10-24/25)
+
+1. **回滚链**:V9 tar 备份(md5 c76369c2…)→ 提取四文件(gguf.cu=`2bf4ae73…` 复核一致,
+   大写 `ValidColumns` 零命中)→ NAS 全量 cmake 构建 → 手工 nvcc 配方重建 oracle →
+   runtime 镜像 `sha256:643c367`(`FROM ninfer:p100-builder` + COPY 两 bin)→ compose 重建,
+   容器镜像与 V9 镜像 ID 对齐,`/v1/models` 冒烟通过。**教训**:首轮回滚用短 ID 手工
+   `docker tag`+`compose up` 因引号事故未生效,服务曾在 V10b 慢镜像上运行 ~1h——回滚必须
+   以 `docker inspect {{.Image}}` 与构建输出哈希双向对账。
+2. **GitHub 首推**:`catmel/ninfer-p100-duo` main=`bf5649e`(1542 文件,仅源码:排除
+   build*/、*.exe、备份 tar、*.i64 语料、链接伴生物;真实密钥模式扫描 0 命中)。README 重写为
+   P100 身份 + fork lineage(Neroued@feaf4dd → wamansou TP2-1m → geoffwatts v100(+huangserva
+   v100-tpx)→ tuxKOH V100-Duo → 本仓库)+ vendored/审计引用两表;NOTICE 追加 P100 派生段。
+3. **全量基线资格(full_qual E1-E5,2026-10-25 00:49-00:53,NAS 实测)**:硬件快照修正历史口径
+   ——"P100-PCIe"实为 **2× Tesla P100-SXM2-16GB, NVLink NV4(4-link), driver 580.142,
+   CUDA 12.8, max clock 1480MHz**(README/台账统一更正)。E1 ctest rc=0;E2 GGUF-native
+   oracle **15/15 PASS**;E3 decode 回归 **36/36 PASS**;E4 Q6 A/B draft-3×3 =
+   **33.34/33.35/33.37** tok/s(prefill 67.96/68.13/68.22)= V9 生产值复现 ✓;E5 serve
+   chat completion OK。E6 = Q4/Q6 各 2K→128K 每 2K 衰减曲线(运行中,归档
+   `bench/p100-duo/qual-20261025/`,完成后单独提交)。
+4. **Q4 artifact**:`Qwen3.8-27B-Coder390-EfficientThink-Q4LynnStyle-Q4MTP.ninfer`
+   (18.5 GiB,HF nerkyor GGUF-NInfer;SHA256 `e445a0a9…` 校验进行中)——NAS 经本机代理拉
+   xet CDN 尾段跌速,切 hf-mirror 续传。
 
 ## 8. 已落地的构建切片决策(2026-10-23 第二轮)
 

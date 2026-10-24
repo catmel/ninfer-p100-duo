@@ -1,7 +1,7 @@
 # NInfer P100 Duo — Qwen3.8-27B 推理引擎（2× Tesla P100, sm_60, TP2 NVLink）
 
 **English summary**: a fork of the NInfer LLM inference engine, migrated to
-dual Tesla P100 (GP100, `sm_60`) PCIe cards with NVLink1.0. Tensor-parallel decode with CUDA
+dual Tesla P100 (GP100, `sm_60`) SXM2 cards with 4-link NVLink1.0. Tensor-parallel decode with CUDA
 Graphs, speculative MTP decoding, and OpenAI-compatible serving. Qwen3.8-27B Q6_K runs at
 **33.4 tok/s decode / ~68 tok/s prefill** on 2×16 GB P100. Provenance and third-party citations:
 see the two tables below and [`NOTICE`](NOTICE).
@@ -21,11 +21,11 @@ GP100），并完成 TP2 双卡验证与性能基线。全部迁移决策、实�
 | 3 | geoffwatts/ninfer-v100 | <https://github.com/geoffwatts/ninfer-v100> | Volta (sm_70) 内核与构建支持移植 |
 | 3b | huangserva/ninfer-v100-tpx | <https://github.com/huangserva/ninfer-v100-tpx> | TP2 INT8 key-split Volta attention 设计的适配来源（见 `NOTICE`） |
 | 4 | tuxKOH/ninfer-V100-Duo | <https://github.com/tuxKOH/ninfer-V100-Duo> | **直接基线**：V100 双卡集成，保留 GGUF Q4_K/Q6_K artifact 转换与执行路径 |
-| 5 | **catmel/ninfer-p100-duo（本仓库）** | <https://github.com/catmel/ninfer-p100-duo> | **sm_60 (P100) 迁移**：`NINFER_PASCAL_BUILD` 构建门控、P100 SIMT 反量化 GEMV 路线、双 P100 NVLink/PCIe 全链路验证与性能基线 |
+| 5 | **catmel/ninfer-p100-duo（本仓库）** | <https://github.com/catmel/ninfer-p100-duo> | **sm_60 (P100) 迁移**：`NINFER_PASCAL_BUILD` 构建门控、P100 SIMT 反量化 GEMV 路线、双 P100 NVLink 全链路验证与性能基线 |
 
 本仓库在第 4 项基础上的改动范围：顶层 CMake 的 arch-60 门控、`src/ops` 各算子族在 `sm_60` 的
 可选路由（dp4a 缺失、cp.async 降级、fp16x2 死路等 GP100 事实的处理）、Windows/Linux 双工具链
-构建、Tesla P100-PCIe 16GB×2（NVLink1.0 互联）上的 TP2 验证与实测台账。
+构建、Tesla P100-SXM2 16GB×2（4 链路 NVLink1.0）上的 TP2 验证与实测台账。
 
 ## 引用的第三方开源项目
 
@@ -52,23 +52,24 @@ llama.cpp 官方在 P100 上的公开基线。本项目对它们的 kernel 做�
 | Artifact | 量化 | 说明 |
 |---|---|---|
 | Qwen3.8-27B Coder390 EfficientThink **Q6_K** MTP | GGUF Q6_K + int8 KV | 主形态；16 GB×2 显存内完全容纳，含全词表 MTP 投机头 |
-| Qwen3.8-27B **Q4_K** MTP | GGUF Q4_K + int8 KV | 低显存/高吞吐形态（基线数据见性能表） |
+| Qwen3.8-27B Coder390 **Q4LynnStyle** MTP | GGUF Q4 级混合量化 + int8 KV | 低显存/高吞吐形态（基线数据见性能表） |
 
-Q6_K artifact 下载地址：<https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-GGUF-NInfer>
-（下载 `.ninfer` artifact，而非源 checkpoint 或原始 GGUF）。
+模型系列下载地址（下载 `.ninfer` artifact，而非源 checkpoint 或原始 GGUF）：
+<https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-GGUF-NInfer/tree/main/GGUF-NInfer>
 
-## 实测性能（2× Tesla P100-PCIe 16GB，NVLink1.0 + PCIe，CUDA 12.8，TP2）
+## 实测性能（2× Tesla P100-SXM2 16GB，4 链路 NVLink1.0，CUDA 12.8，TP2）
 
 统一条件：`--tp 2 --devices 0,1 --spec mtp --draft-tokens 3 --max-new 160`，空闲 GPU，
-固定英文 prompt；decode 为端到端生成速度。
+固定英文 prompt；decode 为端到端生成速度。完整实测证据（硬件快照、oracle、A/B、128K 衰减曲线）
+按日期归档在 [`bench/p100-duo/`](bench/p100-duo/)。
 
 | Artifact | prefill tok/s | decode tok/s | 备注 |
 |---|---|---|---|
 | Q6_K-MTP | ~68 | **33.35**（×3：33.34/33.36/33.36） | 生产基线（V9 验证态） |
-| Q4_K-MTP | 待测 | 待测 | 全量基线测试进行中，随结果更新 |
+| Q4LynnStyle-Q4MTP | 待测 | 待测 | 全量基线测试进行中，随结果更新 |
 
 完整的达标/回退实验矩阵（含全部失败方向与原因）记录在
-[`docs/p100-migration.md`](docs/p100-migration.md) §6–§7；数值资格记录（oracle 45 项等）在其 §7.x。
+[`docs/p100-migration.md`](docs/p100-migration.md) §6–§7。
 
 ## 构建
 
@@ -103,10 +104,12 @@ TP2 依赖 direct P2P：启动日志的 `direct peer P2P qualified` 行为资格
 
 ## 测试与验证体系
 
-- **数值 oracle**：每个浮点算子以朴素 FP64 独立实现对照（GGUF-native vector 路 15 形状 ×
-  FP64 预算 + valid-columns 界 30 项；groupwise-int decode 回归 36/36），工具在 `tools/p100/`。
+- **数值 oracle**：每个浮点算子以朴素 FP64 独立实现对照（GGUF-native vector 路 FP64 预算
+  用例全绿；groupwise-int decode 回归 36/36），工具在 `tools/p100/`。
 - **端到端回归**：`tests/`（TP1 golden-token 一致性、双卡图捕获、分裂算子对照）。
 - **P100 专项探针**：`tools/p100/` 内核微基准（GEMV 变体矩阵）、拓扑/P2P 资格检查。
+- **上下文衰减基线**：`bench/p100-duo/` 归档 2K–128K 每 2K 采样的 prefill/decode 曲线
+  （Q4/Q6 各一条），复现脚本 `bench/p100-duo/ctx_decay_bench.sh`。
 - **性能声明口径**：端到端数字只在整机推理层面声明，Op 微基准仅用于内核归因
   （方法论见 [`docs/performance/methodology.md`](docs/performance/methodology.md)）。
 

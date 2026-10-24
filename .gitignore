@@ -61,3 +61,4 @@ tools_bin/
 *.i64
 *.exp
 *.lib
+.ctxbench/
