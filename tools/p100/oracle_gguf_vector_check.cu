@@ -84,6 +84,43 @@ static void encode_q6_k_block(unsigned char* block, std::uint32_t& state, double
     }
 }
 
+// Encodes one llama-layout Q5_K block (176 bytes, 256 values): half d, half dmin,
+// u8 scales[12] (Q4_K's 6-bit scale/min pairs), u8 qh[32] (5th bit, bit index = 32-value
+// sub-block), u8 qs[128] (low nibbles, sub-block pairs sharing 32-byte chunks).
+static void encode_q5_k_block(unsigned char* block, std::uint32_t& state, double* decoded) {
+    const std::uint16_t d_bits = float_to_f16_bits(0.008F + static_cast<float>(next_rand(state) % 24u) * 0.001F);
+    const std::uint16_t dm_bits = float_to_f16_bits(0.002F + static_cast<float>(next_rand(state) % 9u) * 0.0005F);
+    const double d = f16_bits_to_float(d_bits);
+    const double dmin = f16_bits_to_float(dm_bits);
+    std::memset(block, 0, 176);
+    block[0] = static_cast<unsigned char>(d_bits & 0xFFu);
+    block[1] = static_cast<unsigned char>(d_bits >> 8);
+    block[2] = static_cast<unsigned char>(dm_bits & 0xFFu);
+    block[3] = static_cast<unsigned char>(dm_bits >> 8);
+    unsigned sc6[8];
+    unsigned mn6[8];
+    for (int g = 0; g < 8; ++g) {
+        sc6[g] = next_rand(state) % 64u;
+        mn6[g] = next_rand(state) % 64u;
+    }
+    for (int g = 0; g < 4; ++g) {
+        block[4 + g]  = static_cast<unsigned char>(sc6[g] | ((sc6[g + 4] >> 4) << 6));
+        block[8 + g]  = static_cast<unsigned char>(mn6[g] | ((mn6[g + 4] >> 4) << 6));
+        block[12 + g] = static_cast<unsigned char>((sc6[g + 4] & 15u) | ((mn6[g + 4] & 15u) << 4));
+    }
+    for (int i = 0; i < 256; ++i) {
+        const unsigned code = next_rand(state) % 32u;
+        const int g = i >> 5;
+        const int l = i & 31;
+        block[48 + 32 * (g >> 1) + l] =
+            static_cast<unsigned char>(block[48 + 32 * (g >> 1) + l] | ((code & 15U) << (4 * (g & 1))));
+        if (code >> 4) { block[16 + l] = static_cast<unsigned char>(block[16 + l] | (1U << g)); }
+        const double scale = d * static_cast<double>(sc6[g]);
+        const double min   = dmin * static_cast<double>(mn6[g]);
+        decoded[i] = scale * static_cast<double>(code) - min;
+    }
+}
+
 // Tiled GDN value-head column order (mirrors the documented production mapping, re-derived here
 // so the oracle is independent of the kernel source).
 static int tiled_input_column(int column, int k) {
@@ -114,11 +151,13 @@ struct GgufCase {
     bool tiled        = false;
     int seg1          = 0;  // first-segment rows for a two-segment weight; 0 = single segment
     int split_out     = 0;  // section-0 rows for a two-output split; 0 = single output
+    GgufType type     = GgufType::Q6_K;
 };
 
 static bool run(const GgufCase& c) {
     std::uint32_t state = 0x243F6A88u ^ static_cast<std::uint32_t>(c.n * 131 + c.tokens);
     const int n = c.n, k = c.k, tokens = c.tokens;
+    const int block_bytes = c.type == GgufType::Q5_K ? 176 : 210;
 
     std::vector<std::uint16_t> x_bits(static_cast<std::size_t>(k) * tokens);
     std::vector<double> x_val(static_cast<std::size_t>(k) * tokens);
@@ -132,7 +171,7 @@ static bool run(const GgufCase& c) {
     }
 
     const int blocks_per_row = k / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(blocks_per_row) * 210;
+    const std::size_t row_bytes = static_cast<std::size_t>(blocks_per_row) * block_bytes;
     const int seg1_rows = c.seg1 != 0 ? c.seg1 : n;
     const int seg2_rows = n - seg1_rows;
     std::vector<unsigned char> host1(static_cast<std::size_t>(seg1_rows) * row_bytes);
@@ -144,7 +183,9 @@ static bool run(const GgufCase& c) {
                                   (row < seg1_rows ? static_cast<std::size_t>(row) * row_bytes
                                                    : static_cast<std::size_t>(row - seg1_rows) * row_bytes);
         for (int b = 0; b < blocks_per_row; ++b) {
-            encode_q6_k_block(row_base + static_cast<std::size_t>(b) * 210, state, decoded.data());
+            unsigned char* blk = row_base + static_cast<std::size_t>(b) * block_bytes;
+            if (c.type == GgufType::Q5_K) { encode_q5_k_block(blk, state, decoded.data()); }
+            else { encode_q6_k_block(blk, state, decoded.data()); }
             for (int i = 0; i < 256; ++i) {
                 const int stored = b * 256 + i;
                 const int src    = c.tiled ? tiled_input_column(stored, k) : stored;
@@ -182,8 +223,8 @@ static bool run(const GgufCase& c) {
     w.padded_shape[0]    = n;
     w.padded_shape[1]    = k;
     w.gguf_segment_count = seg2_rows > 0 ? 2 : 1;
-    w.gguf_segments[0]   = GgufSegment{d_w1, seg1_rows, GgufType::Q6_K};
-    if (seg2_rows > 0) { w.gguf_segments[1] = GgufSegment{d_w2, seg2_rows, GgufType::Q6_K}; }
+    w.gguf_segments[0]   = GgufSegment{d_w1, seg1_rows, c.type};
+    if (seg2_rows > 0) { w.gguf_segments[1] = GgufSegment{d_w2, seg2_rows, c.type}; }
 
     Tensor out(d_out, DType::BF16, {n, tokens});
     const std::vector<Tensor> outs = c.split_out > 0
@@ -261,6 +302,10 @@ int main(int argc, char** argv) {
         {"tiled3072-t8", 2048, 3072, 8, true},
         {"two-seg-t3",   2048,  512, 3, false, 1024},
         {"split-out-t6", 2048,  512, 6, false, 0, 1024},
+        {"q5k-wide-t1", 17408, 5120, 1, false, 0, 0, GgufType::Q5_K},
+        {"q5k-wide-t4", 17408, 5120, 4, false, 0, 0, GgufType::Q5_K},
+        {"q5k-tall-t1", 65536,  512, 1, false, 0, 0, GgufType::Q5_K},
+        {"q5k-tiled-t8", 2048, 3072, 8, true, 0, 0, GgufType::Q5_K},
     };
     bool all = true;
     for (const GgufCase& c : cases) {

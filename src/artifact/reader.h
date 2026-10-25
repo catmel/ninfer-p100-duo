@@ -38,6 +38,7 @@ enum class NumericFormat {
     GGUF_IQ1_M,
     GGUF_Q2_K,
     GGUF_Q4_K,
+    GGUF_Q5_K,
     GGUF_Q6_K,
     GGUF_Q8_0,
 };

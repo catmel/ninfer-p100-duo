@@ -246,6 +246,33 @@ std::array<double, 256> oracle(GgufType type, const std::uint8_t* b) {
             is += 2;
         }
     } break;
+    case GgufType::Q5_K: {
+        const double d = h(b), min = h(b + 2);
+        const std::uint8_t* scales = b + 4;
+        const std::uint8_t* qh = b + 16;
+        const std::uint8_t* q = b + 48;
+        const auto scale_min = [&](int j, int& s, int& m) {
+            if (j < 4) {
+                s = scales[j] & 63;
+                m = scales[j + 4] & 63;
+            } else {
+                s = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+                m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+            }
+        };
+        for (int j = 0; j < 256; j += 32) {
+            const int sub = j / 32;
+            int s, m;
+            scale_min(sub, s, m);
+            const double d1 = d * s, m1 = min * m;
+            for (int l = 0; l < 32; ++l) {
+                const int nib  = (q[l] >> (4 * (sub & 1))) & 0xF;
+                const int high = (qh[l] >> sub) & 1;
+                *out++ = d1 * (nib | (high << 4)) - m1;
+            }
+            if (sub & 1) { q += 32; }
+        }
+    } break;
     case GgufType::Q6_K: {
         const double d = h(b + 208);
         const std::uint8_t* ql = b;
@@ -304,6 +331,10 @@ void random_block(GgufType type, std::uint8_t* b, std::mt19937& rng) {
         put_half(b + 82, d * 0.5F);
         break;
     case GgufType::Q4_K:
+        put_half(b, d);
+        put_half(b + 2, d * 0.5F);
+        break;
+    case GgufType::Q5_K:
         put_half(b, d);
         put_half(b + 2, d * 0.5F);
         break;
@@ -373,7 +404,7 @@ HostWeight make_weight(const std::vector<std::pair<GgufType, int>>& segments, in
 
 const char* name(GgufType type) {
     static const char* names[] = {"IQ4_XS", "IQ3_S", "IQ3_XXS", "IQ2_XS", "IQ2_XXS",
-                                  "IQ2_S",  "IQ1_M", "Q2_K",    "Q4_K",   "Q6_K", "Q8_0"};
+                                  "IQ2_S",  "IQ1_M", "Q2_K",    "Q4_K",   "Q6_K", "Q8_0", "Q5_K"};
     return names[static_cast<int>(type)];
 }
 
@@ -593,7 +624,7 @@ int main() {
         const GgufType all[] = {GgufType::IQ4_XS, GgufType::IQ3_S, GgufType::IQ3_XXS,
                                 GgufType::IQ2_XS, GgufType::IQ2_XXS, GgufType::IQ2_S,
                                 GgufType::IQ1_M,  GgufType::Q2_K,  GgufType::Q4_K,
-                                GgufType::Q6_K, GgufType::Q8_0};
+                                GgufType::Q6_K, GgufType::Q8_0, GgufType::Q5_K};
         // Every format: exact decode, vector passes at 1..9 columns (two passes at 9), and the
         // tensor-core route above 16 columns.
         for (const GgufType type : all) {

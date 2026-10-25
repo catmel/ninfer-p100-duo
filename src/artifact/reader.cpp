@@ -118,6 +118,7 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "GGUF_IQ1_M") { return NumericFormat::GGUF_IQ1_M; }
     if (name == "GGUF_Q2_K") { return NumericFormat::GGUF_Q2_K; }
     if (name == "GGUF_Q4_K") { return NumericFormat::GGUF_Q4_K; }
+    if (name == "GGUF_Q5_K") { return NumericFormat::GGUF_Q5_K; }
     if (name == "GGUF_Q6_K") { return NumericFormat::GGUF_Q6_K; }
     if (name == "GGUF_Q8_0") { return NumericFormat::GGUF_Q8_0; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
@@ -785,7 +786,8 @@ private:
                     {"gguf_iq3_xxs", "GGUF_IQ3_XXS"}, {"gguf_iq2_xs", "GGUF_IQ2_XS"},
                     {"gguf_iq2_xxs", "GGUF_IQ2_XXS"}, {"gguf_iq2_s", "GGUF_IQ2_S"},
                     {"gguf_iq1_m", "GGUF_IQ1_M"}, {"gguf_q2_k", "GGUF_Q2_K"},
-                    {"gguf_q4_k", "GGUF_Q4_K"}, {"gguf_q6_k", "GGUF_Q6_K"},
+                    {"gguf_q4_k", "GGUF_Q4_K"}, {"gguf_q5_k", "GGUF_Q5_K"},
+                    {"gguf_q6_k", "GGUF_Q6_K"},
                     {"gguf_q8_0", "GGUF_Q8_0"},
                 };
                 static const std::map<std::string, std::string, std::less<>> layouts = {

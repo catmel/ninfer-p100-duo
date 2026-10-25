@@ -37,6 +37,7 @@ StorageLayout storage_layout_for(NumericFormat format) {
     case NumericFormat::GGUF_IQ1_M:
     case NumericFormat::GGUF_Q2_K:
     case NumericFormat::GGUF_Q4_K:
+    case NumericFormat::GGUF_Q5_K:
     case NumericFormat::GGUF_Q6_K:
     case NumericFormat::GGUF_Q8_0:
         return StorageLayout::GgufBlocksV1;
@@ -55,6 +56,7 @@ GgufType gguf_type_for(NumericFormat format) {
     case NumericFormat::GGUF_IQ1_M: return GgufType::IQ1_M;
     case NumericFormat::GGUF_Q2_K: return GgufType::Q2_K;
     case NumericFormat::GGUF_Q4_K: return GgufType::Q4_K;
+    case NumericFormat::GGUF_Q5_K: return GgufType::Q5_K;
     case NumericFormat::GGUF_Q6_K: return GgufType::Q6_K;
     case NumericFormat::GGUF_Q8_0: return GgufType::Q8_0;
     default: throw std::logic_error("not a GGUF block format");

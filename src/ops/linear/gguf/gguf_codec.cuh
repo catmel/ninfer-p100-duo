@@ -226,6 +226,35 @@ __device__ __forceinline__ void decode8<GgufType::Q4_K>(const unsigned char* b, 
     }
 }
 
+// block_q5_K: half d, half dmin, u8 scales[12] (6-bit scale/min pairs, Q4_K packing),
+// u8 qh[32] (5th bit per value, bit index = 32-value sub-block), u8 qs[128] (low 4 bits,
+// sub-block pairs interleaved like Q4_K). Value = scale * (low | high<<4) - min.
+template <>
+__device__ __forceinline__ void decode8<GgufType::Q5_K>(const unsigned char* b, int j8,
+                                                        float (&w)[8]) {
+    const int group = j8 >> 2;
+    unsigned scale_code;
+    unsigned min_code;
+    if (group < 4) {
+        scale_code = u8(b, 4 + group) & 63U;
+        min_code   = u8(b, 8 + group) & 63U;
+    } else {
+        scale_code = (u8(b, 4 + group + 4) & 15U) | ((u8(b, 4 + group - 4) >> 6) << 4);
+        min_code   = (u8(b, 4 + group + 4) >> 4) | ((u8(b, 4 + group) >> 6) << 4);
+    }
+    const float scale = f16(b, 0) * static_cast<float>(scale_code);
+    const float min   = f16(b, 2) * static_cast<float>(min_code);
+    const int q_base  = 48 + (group >> 1) * 32 + (j8 & 3) * 8;
+    const int h_base  = 16 + (j8 & 3) * 8;
+    const int shift   = 4 * (group & 1);
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+        const unsigned low  = (u8(b, q_base + v) >> shift) & 15U;
+        const unsigned high = (u8(b, h_base + v) >> group) & 1U;
+        w[v] = scale * static_cast<float>(low | (high << 4)) - min;
+    }
+}
+
 // block_q6_K: u8 ql[128], u8 qh[64], i8 scales[16], half d.
 template <>
 __device__ __forceinline__ void decode8<GgufType::Q6_K>(const unsigned char* b, int j8,
@@ -265,7 +294,7 @@ __device__ __forceinline__ void decode8<GgufType::Q8_0>(const unsigned char* blo
 
 template <GgufType Type>
 inline constexpr bool kHasMinimum = Type == GgufType::Q2_K || Type == GgufType::Q4_K ||
-                             Type == GgufType::IQ1_M;
+                             Type == GgufType::Q5_K || Type == GgufType::IQ1_M;
 
 // Expands four sign bits into byte masks (0x00 or 0xff per byte) and negates the selected bytes of
 // a word of non-negative grid values.
@@ -461,6 +490,31 @@ __device__ __forceinline__ void decode_i8<GgufType::Q4_K>(const unsigned char* b
 }
 
 template <>
+__device__ __forceinline__ void decode_i8<GgufType::Q5_K>(const unsigned char* b, int j8,
+                                                          int (&w)[2], float& scale,
+                                                          float& minimum, const void*) {
+    const int group = j8 >> 2;
+    unsigned scale_code;
+    unsigned min_code;
+    if (group < 4) {
+        scale_code = u8(b, 4 + group) & 63U;
+        min_code   = u8(b, 8 + group) & 63U;
+    } else {
+        scale_code = (u8(b, 4 + group + 4) & 15U) | ((u8(b, 4 + group - 4) >> 6) << 4);
+        min_code   = (u8(b, 4 + group + 4) >> 4) | ((u8(b, 4 + group) >> 6) << 4);
+    }
+    scale           = f16(b, 0) * static_cast<float>(scale_code);
+    minimum         = f16(b, 2) * static_cast<float>(min_code);
+    const int q_base = 48 + (group >> 1) * 32 + (j8 & 3) * 8;
+    const int h_base = 16 + (j8 & 3) * 8;
+    const int shift  = 4 * (group & 1);
+    const unsigned high0 = ((u32(b, h_base) >> group) & 0x01010101U) << 4;
+    const unsigned high1 = ((u32(b, h_base + 4) >> group) & 0x01010101U) << 4;
+    w[0] = static_cast<int>(((u32(b, q_base) >> shift) & 0x0f0f0f0fU) | high0);
+    w[1] = static_cast<int>(((u32(b, q_base + 4) >> shift) & 0x0f0f0f0fU) | high1);
+}
+
+template <>
 __device__ __forceinline__ void decode_i8<GgufType::Q6_K>(const unsigned char* b, int j8,
                                                           int (&w)[2], float& scale, float&, const void*) {
     const int i       = 8 * j8;
@@ -503,6 +557,7 @@ __device__ __forceinline__ void decode8(GgufType type, const unsigned char* bloc
     case GgufType::IQ1_M: decode8<GgufType::IQ1_M>(block, j8, w); return;
     case GgufType::Q2_K: decode8<GgufType::Q2_K>(block, j8, w); return;
     case GgufType::Q4_K: decode8<GgufType::Q4_K>(block, j8, w); return;
+    case GgufType::Q5_K: decode8<GgufType::Q5_K>(block, j8, w); return;
     case GgufType::Q6_K: decode8<GgufType::Q6_K>(block, j8, w); return;
     case GgufType::Q8_0: decode8<GgufType::Q8_0>(block, j8, w); return;
     }

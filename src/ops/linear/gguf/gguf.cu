@@ -409,6 +409,7 @@ void launch_vector(const VectorInput& x, const GgufSegment& segment, int first_r
         NINFER_GGUF_TYPE_CASE(IQ1_M)
         NINFER_GGUF_TYPE_CASE(Q2_K)
         NINFER_GGUF_TYPE_CASE(Q4_K)
+        NINFER_GGUF_TYPE_CASE(Q5_K)
         NINFER_GGUF_TYPE_CASE(Q6_K)
         NINFER_GGUF_TYPE_CASE(Q8_0)
 #undef NINFER_GGUF_TYPE_CASE
@@ -464,6 +465,7 @@ void launch_dequantize(const GgufSegment& segment, int row_begin, int row_count,
         NINFER_GGUF_TYPE_CASE(IQ1_M)
         NINFER_GGUF_TYPE_CASE(Q2_K)
         NINFER_GGUF_TYPE_CASE(Q4_K)
+        NINFER_GGUF_TYPE_CASE(Q5_K)
         NINFER_GGUF_TYPE_CASE(Q6_K)
         NINFER_GGUF_TYPE_CASE(Q8_0)
 #undef NINFER_GGUF_TYPE_CASE

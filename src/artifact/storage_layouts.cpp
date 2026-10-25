@@ -86,6 +86,7 @@ std::uint64_t gguf_block_bytes(NumericFormat format) noexcept {
     case NumericFormat::GGUF_IQ1_M: return 56;
     case NumericFormat::GGUF_Q2_K: return 84;
     case NumericFormat::GGUF_Q4_K: return 144;
+    case NumericFormat::GGUF_Q5_K: return 176;
     case NumericFormat::GGUF_Q6_K: return 210;
     case NumericFormat::GGUF_Q8_0: return 34;
     default: return 0;
@@ -180,6 +181,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "GGUF_Q2_K";
     case NumericFormat::GGUF_Q4_K:
         return "GGUF_Q4_K";
+    case NumericFormat::GGUF_Q5_K:
+        return "GGUF_Q5_K";
     case NumericFormat::GGUF_Q6_K:
         return "GGUF_Q6_K";
     case NumericFormat::GGUF_Q8_0:

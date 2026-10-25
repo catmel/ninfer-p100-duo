@@ -54,9 +54,10 @@ enum class GgufType : std::uint8_t {
     Q4_K    = 8,
     Q6_K    = 9,
     Q8_0    = 10,
+    Q5_K    = 11,
 };
 
-inline constexpr int kGgufTypeCount = 11;
+inline constexpr int kGgufTypeCount = 12;
 
 constexpr int gguf_block_values(GgufType type) {
     return type == GgufType::Q8_0 ? 32 : 256;
@@ -73,6 +74,7 @@ constexpr int gguf_block_bytes(GgufType type) {
     case GgufType::IQ1_M: return 56;
     case GgufType::Q2_K: return 84;
     case GgufType::Q4_K: return 144;
+    case GgufType::Q5_K: return 176;
     case GgufType::Q6_K: return 210;
     case GgufType::Q8_0: return 34;
     }
