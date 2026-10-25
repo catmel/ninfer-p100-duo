@@ -3,7 +3,7 @@
 # For each target prompt-token length 2048.. up to (MC - MAXNEW - margin), step STEPK:
 # build a messages.json prompt of ~N tokens, run one CLI generation, record REAL prompt
 # tokens + prefill/decode speed + MTP accept%. bytes-per-token calibrated from corpus.
-# Usage: ctx_decay_bench.sh MODEL_NAME_WITHOUT_SUFFIX OUT.csv [MC=65536] [STEPK=2048] [MAXNEW=96]
+# Usage: ctx_decay_bench.sh MODEL_NAME_WITHOUT_SUFFIX OUT.csv [MC=65536] [STEPK=2048] [MAXNEW=96] [START_K=STEPK]
 # Assumes GPUs are free (service stopped) — caller's responsibility.
 set -u
 SRC=/vol1/1000/code/ninfer-p100-duo
@@ -13,6 +13,7 @@ OUT=${2:?output csv required}
 MC=${3:-65536}
 STEPK=${4:-2048}
 MAXNEW=${5:-96}
+START=${6:-$STEPK}
 BPT=5.8   # measured bytes/token on this corpus (Q6: 21000B -> 3620 tok)
 PD=$SRC/.ctxbench
 mkdir -p "$PD"   # gitignored scratch (see .gitignore: .ctxbench/)
@@ -46,7 +47,7 @@ fi
 echo "run,target_tokens,max_context,prompt_tokens,prefill_tps,decode_tps,generated,accept_n,accept_pct,wall_s,rc" > "$OUT"
 i=0
 LIMIT=$(( MC - MAXNEW - 256 ))
-for t in $(seq "$STEPK" "$STEPK" "$LIMIT"); do
+for t in $(seq "$START" "$STEPK" "$LIMIT"); do
   i=$((i+1))
   bytes=$(python3 -c "print(int($t * $BPT))")
   head -c "$bytes" "$CORPUS" > "$PD/p.txt"
