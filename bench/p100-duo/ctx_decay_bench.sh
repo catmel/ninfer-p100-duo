@@ -1,17 +1,19 @@
 #!/bin/bash
 # Context-length decay benchmark for NInfer P100 Duo (2x P100 TP2, containerized run).
-# For each target length 2K..MAXK step STEPK: build a messages.json prompt of ~N tokens,
-# run one CLI generation, record REAL prompt tokens + prefill/decode speed + accept%.
-# Usage: ctx_decay_bench.sh MODEL_NAME_WITHOUT_SUFFIX OUT.csv [MAXK=128] [STEPK=2] [MAXNEW=96]
+# For each target prompt-token length 2048.. up to (MC - MAXNEW - margin), step STEPK:
+# build a messages.json prompt of ~N tokens, run one CLI generation, record REAL prompt
+# tokens + prefill/decode speed + MTP accept%. bytes-per-token calibrated from corpus.
+# Usage: ctx_decay_bench.sh MODEL_NAME_WITHOUT_SUFFIX OUT.csv [MC=65536] [STEPK=2048] [MAXNEW=96]
 # Assumes GPUs are free (service stopped) — caller's responsibility.
 set -u
 SRC=/vol1/1000/code/ninfer-p100-duo
 MODELS=/vol1/1000/docker/ninfer-p100x2/models
 MODEL_NAME=${1:?model name without .ninfer suffix}
 OUT=${2:?output csv required}
-MAXK=${3:-128}
-STEPK=${4:-2}
+MC=${3:-65536}
+STEPK=${4:-2048}
 MAXNEW=${5:-96}
+BPT=5.8   # measured bytes/token on this corpus (Q6: 21000B -> 3620 tok)
 PD=$SRC/.ctxbench
 mkdir -p "$PD"   # gitignored scratch (see .gitignore: .ctxbench/)
 IMG=ninfer:p100-builder
@@ -41,11 +43,12 @@ with open(sys.argv[1], "w") as f:
 PY
 fi
 
-echo "run,target_k,prompt_tokens,prefill_tps,decode_tps,generated,accept_pct,wall_s,rc" > "$OUT"
+echo "run,target_tokens,max_context,prompt_tokens,prefill_tps,decode_tps,generated,accept_n,accept_pct,wall_s,rc" > "$OUT"
 i=0
-for k in $(seq "$STEPK" "$STEPK" "$MAXK"); do
+LIMIT=$(( MC - MAXNEW - 256 ))
+for t in $(seq "$STEPK" "$STEPK" "$LIMIT"); do
   i=$((i+1))
-  bytes=$(( k * 2100 ))
+  bytes=$(python3 -c "print(int($t * $BPT))")
   head -c "$bytes" "$CORPUS" > "$PD/p.txt"
   python3 - "$PD/p.txt" "$PD/m.json" <<'PY'
 import json, sys
@@ -53,10 +56,10 @@ msg = [{"role": "user", "content": open(sys.argv[1]).read() + "\n\nSummarize the
 json.dump(msg, open(sys.argv[2], "w"))
 PY
   start=$(date +%s)
-  log=$PD/run_${k}k.log
+  log=$PD/run_${t}.log
   timeout 9000 docker run --rm --gpus all --shm-size 8g \
     -v "$SRC":/work -v "$MODELS":/workspace/models:ro --entrypoint bash "$IMG" -c \
-    "/work/build-p100-duo/apps/ninfer /workspace/models/$MODEL_NAME.ninfer --tp 2 --devices 0,1 --no-thinking --spec mtp --draft-tokens 3 --max-new $MAXNEW --max-context 131072 --messages /work/.ctxbench/m.json" \
+    "/work/build-p100-duo/apps/ninfer /workspace/models/$MODEL_NAME.ninfer --tp 2 --devices 0,1 --no-thinking --spec mtp --draft-tokens 3 --max-new $MAXNEW --max-context $MC --kv-capacity auto --prefill-chunk 2048 --messages /work/.ctxbench/m.json" \
     > "$log" 2>&1
   rc=$?
   wall=$(( $(date +%s) - start ))
@@ -64,9 +67,10 @@ PY
   pre=$(grep -oE 'prefill speed[[:space:]]+[0-9.]+' "$log" | tail -1 | grep -oE '[0-9.]+$')
   dec=$(grep -oE 'decode speed[[:space:]]+[0-9.]+' "$log" | tail -1 | grep -oE '[0-9.]+$')
   gen=$(grep -oE 'generated tokens[[:space:]]+[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')
-  acc=$(grep -oE 'accepted[[:space:]]+[0-9.]+%' "$log" | tail -1 | grep -oE '[0-9.]+')
-  echo "$i,${k}000,${ptok:-NA},${pre:-NA},${dec:-NA},${gen:-NA},${acc:-NA},$wall,$rc" >> "$OUT"
+  accn=$(grep -oE 'accepted tokens[[:space:]]+[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')
+  accp=$(grep 'accepted tokens' "$log" | tail -1 | grep -oE '\(([0-9.]+)%\)' | tr -d '()%')
+  echo "$i,$t,$MC,${ptok:-NA},${pre:-NA},${dec:-NA},${gen:-NA},${accn:-NA},${accp:-NA},$wall,$rc" >> "$OUT"
   sync
-  echo "[$i] ${k}K prompt=${ptok:-NA} pre=${pre:-NA} dec=${dec:-NA} acc=${acc:-NA} wall=${wall}s rc=$rc"
+  echo "[$i] tgt=$t prompt=${ptok:-NA} pre=${pre:-NA} dec=${dec:-NA} acc=${accn:-NA}/${accp:-NA} wall=${wall}s rc=$rc"
 done
 echo "DONE -> $OUT"
